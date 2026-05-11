@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import re
+import difflib
 from collections import Counter
 from datetime import datetime
 
@@ -33,7 +34,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
 from domain.models import DigitalTwinProfile, KnowledgeChunk
 from services.expert_manager import ExpertManager, get_expert_manager
-from services.vector_db_service import ChromaEngine
+from services.vector_db_service import HybridSearchEngine
 
 # [核心节点]：通用数据接入智能体 - 用于自动嗅探数据结构
 from tools.universal_ingestor import UniversalIngestionAgent
@@ -71,7 +72,7 @@ CLIENT_NAME = os.getenv("CLIENT_NAME")
 EXPERT_NAME = os.getenv("EXPERT_NAME")
 
 if not CLIENT_NAME or not EXPERT_NAME:
-    raise ValueError("环境变量 CLIENT_NAME 和 EXPERT_NAME 必须在 .env 中配置")
+    raise ValueError("[致命错误] 环境变量 CLIENT_NAME 和 EXPERT_NAME 必须在 .env 中配置")
 
 
 class SemanticChunker:
@@ -116,6 +117,7 @@ class SemanticChunker:
                             continue
         except Exception as e:
             print(f"[致命拦截] 语料文件读取失败: {e}")
+            print(f"[系统提示] 请检查文件路径是否正确，或文件格式是否为 JSONL")
             raise
         
         print(f"[+] 成功读取 {len(corpus_data)} 行原始数据")
@@ -624,20 +626,106 @@ class LLMJudgeReduce:
     
     def judge_and_reduce(self, all_chunks: List[KnowledgeChunk], expert_id: str) -> List[KnowledgeChunk]:
         """
-        审查并缩减语料到最优质量
+        [知识压缩轨] 通用的分批压缩架构 - 解决 Token 爆炸
         
         输入：所有提取的知识切片、专家ID
         输出：经过首席知识官审查后的高纯度 KnowledgeChunk 列表
         
-        原理：去除重复、解决冲突、整合同类项，输出企业级知识资产
+        原理：
+            1. [物理去重]：使用 difflib 进行模糊语义去重，剔除高度重复内容
+            2. [分批打包]：无视数据类型，强制按 MAX_BATCH_SIZE=40 切分
+            3. [循环提纯]：遍历每个 Batch 独立调用大模型进行知识压缩
+            4. [合并返回]：将所有 Batch 处理后的合法 JSON 数组合并返回
         
         [核心节点]：expert_id 注入 - 确保所有审查后的知识切片关联到指定专家
         """
-        print(f"\n[首席知识官] 开始审查 {len(all_chunks)} 条知识切片...")
+        original_count = len(all_chunks)
+        print(f"\n[知识压缩轨] 开始提纯 {original_count} 条知识切片...")
+        
+        # [0 数据物理熔断锁]
+        if original_count == 0:
+            print(f"[知识压缩轨] 0 数据物理熔断锁触发，返回空列表")
+            return []
         
         try:
-            # [核心节点]：构建首席知识官审查 Prompt（注入 expert_id）
-            prompt = self._build_reduce_prompt(all_chunks, expert_id)
+            # [任务 1]：模糊语义去重 (Fuzzy Semantic Deduplication)
+            print(f"[物理去重] 正在执行模糊语义去重，阈值 0.85...")
+            deduplicated_chunks = []
+            
+            for i, current_chunk in enumerate(all_chunks):
+                current_text = current_chunk.content
+                is_duplicate = False
+                
+                # 与已保留的切片进行相似度比对
+                for existing_chunk in deduplicated_chunks:
+                    similarity = difflib.SequenceMatcher(None, current_text, existing_chunk.content).ratio()
+                    if similarity > 0.85:  # 熔断阈值
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    deduplicated_chunks.append(current_chunk)
+            
+            deduplicated_count = len(deduplicated_chunks)
+            print(f"[物理去重] 发现高度重复切片，已从 {original_count} 压缩至 {deduplicated_count} 条。")
+            
+            # [任务 2]：分批打包 (Batching) - 无视数据类型强制切分
+            MAX_BATCH_SIZE = 40
+            total_batches = (deduplicated_count + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
+            
+            print(f"[知识压缩轨] 检测到 {deduplicated_count} 条切片，将分为 {total_batches} 批处理（每批最多 {MAX_BATCH_SIZE} 条）")
+            
+            all_final_chunks = []
+            
+            # [任务 3]：循环提纯 - 遍历每个 Batch 独立调用大模型
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * MAX_BATCH_SIZE
+                end_idx = min(start_idx + MAX_BATCH_SIZE, deduplicated_count)
+                batch_chunks = deduplicated_chunks[start_idx:end_idx]
+                
+                print(f"[知识压缩轨] 正在提纯第 {batch_idx + 1}/{total_batches} 批数据，当前批次 {len(batch_chunks)} 条...")
+                
+                try:
+                    # 调用 LLM 处理当前批次
+                    batch_final_chunks = self._process_single_batch(batch_chunks, expert_id)
+                    all_final_chunks.extend(batch_final_chunks)
+                    
+                    print(f"[知识压缩轨] 第 {batch_idx + 1} 批提纯完成，精选出 {len(batch_final_chunks)} 条")
+                except Exception as batch_error:
+                    # [全局容错]：单批次失败只丢弃该批次，严禁中断整个流程
+                    print(f"[!] 批次 {batch_idx + 1} 处理失败，跳过该批次: {batch_error}")
+                    continue
+            
+            print(f"[知识压缩轨] 所有批次处理完成，最终精选 {len(all_final_chunks)} 条高纯度知识")
+            return all_final_chunks
+            
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg = str(e)
+            print(f"[!] 首席知识官审查失败: {error_type}: {error_msg}")
+            
+            # [核心节点]：网络错误特殊提示
+            if "ConnectError" in error_type or "Connection" in error_msg:
+                print(f"[!] 网络连接错误，请检查：")
+                print(f"    1. BASE_URL 配置是否正确")
+                print(f"    2. 网络是否需要代理设置")
+                print(f"    3. 运行 python debug_api.py 进行诊断")
+            
+            return all_chunks[:200]  # 降级返回前 200 条
+    
+    def _process_single_batch(self, batch_chunks: List[KnowledgeChunk], expert_id: str) -> List[KnowledgeChunk]:
+        """
+        处理单个批次的知识切片
+        
+        输入：批次知识切片、专家ID
+        输出：该批次经过 LLM 审查后的精选切片
+        """
+        try:
+            # [核心节点]：构建首席知识官审查 Prompt（注入 expert_id + 强力压缩指令）
+            prompt = self._build_reduce_prompt(batch_chunks, expert_id)
+            
+            # [强化指令]：无情的知识压缩机
+            prompt += "\n\n【强化指令】：你是一个无情的知识压缩机。请将这批对话中的客观知识提取为纯粹的 QA 或 SOP。如果发现语义完全重复的内容，必须合并为一条！剔除所有无关的寒暄废话。"
             
             # [核心节点]：调用大模型进行知识审查（肺活量 8192 防止 Token 腰斩）
             response = self.client.chat.completions.create(
@@ -653,16 +741,16 @@ class LLMJudgeReduce:
             
             # 解析结果
             result_text = response.choices[0].message.content
-            print(f"[调试] Reduce 返回内容前 200 字符: {result_text[:200]}")
+            print(f"[调试] 批次 Reduce 返回内容前 200 字符: {result_text[:200]}")
             
             # [核心节点：物理剥壳机]：精准提取 JSON 实体，无论 LLM 加多少废话
             try:
                 result_dict = self._clean_and_parse_json(result_text)
             except (json.JSONDecodeError, ValueError) as e:
-                print(f"[致命拦截] Reduce 阶段 JSON 解析失败: {e}")
-                print(f"[物理剥壳] 尝试备用方案，返回原始数据前 200 条...")
+                print(f"[致命拦截] 批次 Reduce 阶段 JSON 解析失败: {e}")
+                print(f"[物理剥壳] 尝试备用方案，返回原始批次数据...")
                 log_error("JSON_CLEAN_PARSE_FAILED", str(e), "LLMJudgeReduce")
-                return all_chunks[:200]
+                return batch_chunks  # 降级返回当前批次原始数据
             
             # 提取 knowledge_chunks 字段
             if isinstance(result_dict, dict):
@@ -678,12 +766,12 @@ class LLMJudgeReduce:
                     if values and isinstance(values[0], list):
                         result_dict = values[0]
                     else:
-                        print(f"[!] Reduce 返回格式异常，使用原始语料")
-                        return all_chunks[:200]
+                        print(f"[!] 批次 Reduce 返回格式异常，使用原始批次数据")
+                        return batch_chunks
             
             if not isinstance(result_dict, list):
-                print(f"[!] Reduce 返回不是数组，使用原始语料")
-                return all_chunks[:200]
+                print(f"[!] 批次 Reduce 返回不是数组，使用原始批次数据")
+                return batch_chunks
             
             # [核心节点]：利用 Pydantic 强校验审查后的知识切片，强制注入 expert_id
             final_chunks = []
@@ -698,16 +786,15 @@ class LLMJudgeReduce:
                     )
                     final_chunks.append(chunk)
                 except Exception as validation_error:
-                    print(f"[!] 知识切片校验失败: {validation_error}，跳过此项")
+                    print(f"[!] 批次知识切片校验失败: {validation_error}，跳过此项")
                     continue
             
-            print(f"[首席知识官] 审查完成，最终精选 {len(final_chunks)} 条高纯度知识")
             return final_chunks
             
         except Exception as e:
             error_type = type(e).__name__
             error_msg = str(e)
-            print(f"[!] 首席知识官审查失败: {error_type}: {error_msg}")
+            print(f"[!] 批次处理失败: {error_type}: {error_msg}")
             
             # [核心节点]：网络错误特殊提示
             if "ConnectError" in error_type or "Connection" in error_msg:
@@ -716,7 +803,7 @@ class LLMJudgeReduce:
                 print(f"    2. 网络是否需要代理设置")
                 print(f"    3. 运行 python debug_api.py 进行诊断")
             
-            return all_chunks[:200]
+            return batch_chunks  # 降级返回当前批次原始数据
 
 
 class DigitalTwinDistiller:
@@ -799,9 +886,13 @@ class DigitalTwinDistiller:
 
 4. communication_style (沟通风格)
    - 描述专家的沟通方式和专业话术特征
-   - 字段包括：tone（语气风格）、response_pattern（响应模式）、key_phrases（高频专业表达）
-   - 示例：{{"tone": "严谨专业", "response_pattern": "先诊断后解决", "key_phrases": ["建议", "必须", "严禁"]}}
+   - 字段包括：tone（语气风格）、response_pattern（响应模式）、key_phrases（高频专业表达）、standard_scripts（金牌话术模板）
+   - 示例：{{"tone": "严谨专业", "response_pattern": "先诊断后解决", "key_phrases": ["建议", "必须", "严禁"], "standard_scripts": ["建议您尽快带孩子去医院做进一步检查", "这款目前库存紧张，建议先拍下锁单"]}}
    - [核心节点]：即便语料很少，也要根据现有对话总结出语气特征
+   
+【金牌话术提取指令】：你必须从语料中提取出该专家反复使用的、具有行业特征的 3-5 句"金牌话术模板"（如：安抚话术、逼单话术、免责话术）。
+- 这些话术必须是专家的【原话原句】，不能是你概括的短语！
+- 如果语料中没有明显重复的句子，请提取最具专业代表性的完整句子。
 
 5. business_redlines (业务红线)
    - 专家明确声明的合规边界、禁止事项、硬性约束
@@ -813,6 +904,11 @@ class DigitalTwinDistiller:
    - 用于大模型 Few-Shot 模仿，恢复语气模仿能力
    - 格式：[{{"user_input": "用户提问", "expert_reply": "专家回答"}}]
    - 示例：[{{"user_input": "API如何认证？", "expert_reply": "请使用Bearer Token进行认证..."}}]
+   
+【示例提取绝对红线】：必须像外科医生一样拆分原始对话！
+- user_input：只允许填入客户/患者的原话，绝对禁止混入专家的回答！
+- expert_reply：只允许填入专家/医生的原话，绝对禁止混入客户的提问！
+- 严禁两者内容重复！必须保留专家的真实语气词和口头禅！
 
 7. supported_intents (租户专属业务意图)
    - [核心节点]：根据传入的知识切片，总结出该专家日常处理的 3-5 个核心业务意图
@@ -822,9 +918,10 @@ class DigitalTwinDistiller:
    - 示例：["病理问诊", "用药指导", "检查报告解读", "其他咨询"]
    - [核心节点]：意图名称要简洁专业，体现租户业务特色，严禁通用意图如"技术支持"
 
-【提取示例红线】：在提取 golden_few_shots 时，user_input 必须是客户的原话，expert_reply 必须是专家的原话！严禁将两者的对话合并在一起！严禁复读！
+【提取示例红线】：在提取 golden_few_shots 时，必须像外科手术一样精确分离！
 - 正确示例：{{"user_input": "孩子发烧39度怎么办？", "expert_reply": "建议立即物理降温并就医"}}
 - 错误示例（严禁）：{{"user_input": "用户问孩子发烧怎么办，专家回答建议就医", "expert_reply": ""}} —— 这是严重错误！
+- 错误示例（严禁）：{{"user_input": "孩子发烧39度怎么办？建议立即物理降温", "expert_reply": "孩子发烧39度怎么办？建议立即物理降温"}} —— 这是复读机错误！
 
 【输出规范】：严格对齐 DigitalTwinProfile 数据契约，输出纯 JSON
 - 必须包含 DigitalTwinProfile 模型定义的所有字段，缺一不可
@@ -845,13 +942,14 @@ class DigitalTwinDistiller:
     "communication_style": {{
         "tone": "语气风格",
         "response_pattern": "响应模式",
-        "key_phrases": ["高频专业表达1", "高频专业表达2"]
+        "key_phrases": ["高频专业表达1", "高频专业表达2"],
+        "standard_scripts": ["金牌话术模板1", "金牌话术模板2", "金牌话术模板3"]
     }},
     "business_redlines": ["业务红线1", "业务红线2"],
     "golden_few_shots": [
         {{
-            "user_input": "典型用户提问（客户原话）",
-            "expert_reply": "专家标准回答（专家原话）"
+            "user_input": "典型用户提问（必须是客户原话，严禁包含专家回答）",
+            "expert_reply": "专家标准回答（必须是专家原话，严禁与user_input重复）"
         }}
     ],
     "supported_intents": ["意图1", "意图2", "意图3", "闲聊兜底"]
@@ -935,20 +1033,31 @@ class DigitalTwinDistiller:
     )
     def distill_digital_twin(self, corpus: List[KnowledgeChunk], expert_id: str) -> DigitalTwinProfile:
         """
-        使用 LLM 从语料中蒸馏数字孪生专家画像
+        [灵魂侧写轨] 独立采样与反复读机架构 - 解决示例复读机
         
         输入：完整企业知识语料库、专家ID
         输出：DigitalTwinProfile 对象
         
-        原理：提取企业级专家画像，对接 DigitalTwinProfile 数据契约
+        原理：
+            1. [独立采样]：直接传入 Map 阶段提取的原汁原味切片，保证语气保真度
+            2. [斩断复读幻觉]：针对 golden_few_shots 提取加入绝对红线
+            3. [数字孪生侧写]：对接 DigitalTwinProfile 数据契约
         
         [核心节点]：工业级容错 - 网络抖动时自动进行 3 次指数退避重试
         [核心节点]：expert_id 注入 - 确保专家画像包含正确的专家标识
         """
-        print(f"[-] 正在进行企业语料采样，抽取最具代表性的 {min(50, len(corpus))} 条知识切片...")
+        # [任务 1]：独立采样 - 直接传入 Map 阶段原汁原味切片
+        print(f"[灵魂侧写轨] 正在进行独立采样，抽取最具代表性的 {min(50, len(corpus))} 条原汁原味切片...")
+        
+        # 随机采样 50 条原汁原味切片（不使用 Reduce 压缩后的干瘪数据）
+        import random
+        sample_size = min(50, len(corpus))
+        sampled_corpus = random.sample(corpus, sample_size) if len(corpus) > sample_size else corpus
+        
+        print(f"[灵魂侧写轨] 已采样 {len(sampled_corpus)} 条原汁原味切片，保证语气保真度")
         
         # [核心节点]：构建数字孪生侧写 Prompt（注入 expert_id）
-        prompt = self._build_distillation_prompt(corpus, expert_id)
+        prompt = self._build_distillation_prompt(sampled_corpus, expert_id)
         
         try:
             # [核心节点]：调用大模型进行专家画像侧写（肺活量 8192 防止 Token 腰斩）
@@ -1201,7 +1310,7 @@ def run_map_reduce_etl(
         print(f"步骤 5: 知识向量化入库 - 向量数据库")
         print(f"{'='*80}")
         try:
-            vector_engine = ChromaEngine()
+            vector_engine = HybridSearchEngine()
             vector_engine.upsert_full_corpus(
                 expert_id=expert_id,
                 knowledge_base=final_corpus
@@ -1250,7 +1359,7 @@ def run_full_pipeline(
     1. 通用接入智能体嗅探结构 → 归一化清洗
     2. Map-Reduce ETL 提取知识切片 + 侧写专家画像
     3. ExpertManager 结构化存储
-    4. ChromaEngine 向量数据库入库
+    4. HybridSearchEngine 混合检索引擎入库
     
     [核心联动]：此函数是系统的唯一炼丹指令入口
     """

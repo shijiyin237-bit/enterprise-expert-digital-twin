@@ -1,18 +1,24 @@
 """
-企业级向量数据库服务 - Enterprise Vector Database Service
+企业级混合检索引擎 - Enterprise Hybrid Search Engine
 B 端专家数字孪生系统的物理向量引擎
-使用 ChromaDB 本地向量数据库 + BGE-m3 Embedding API
+使用 ChromaDB 向量数据库 + BM25 关键词检索 + 交叉重排架构
 """
 
 import json
 import os
 import time
+import pickle
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 import openai
 import chromadb
 from chromadb.config import Settings
 from tenacity import retry, wait_exponential, stop_after_attempt
+import requests
+
+# [核心节点]：混合检索依赖库
+import jieba
+from rank_bm25 import BM25Okapi
 
 # 加载环境变量
 load_dotenv()
@@ -25,18 +31,20 @@ EXPERT_NAME = os.getenv("EXPERT_NAME", "专家")
 from domain.models import KnowledgeChunk
 
 
-class ChromaEngine:
+class HybridSearchEngine:
     """
-    ChromaDB 向量引擎 - 多租户专家池版本
+    混合检索引擎 (Hybrid Search Engine) - 多租户专家池版本
     
     输入：原始语料文件路径、查询文本、专家ID
-    输出：向量相似度搜索结果
-    副作用：在本地创建持久化向量数据库
+    输出：经过 BM25 + 向量 + 重排的三路混合搜索结果
+    副作用：在本地创建持久化向量数据库和 BM25 索引
     
-    用途：对全量原始语料进行向量化入库，支持极速语义检索
+    用途：对全量原始语料进行向量化入库，支持语义检索 + 关键词检索 + 交叉重排
     
     [核心节点]：多租户专家池架构 - 通过 expert_id 实现物理级别数据隔离
-    每个专家的知识切片在 metadata 中标记 expert_id，检索时强制过滤
+    每个专家拥有独立的 Chroma 向量库 + BM25 关键词索引 + 重排序能力
+    
+    [核心节点]：业界标准混合检索架构 - Dense Retrieval (向量) + Sparse Retrieval (BM25) + Reranking
     """
     
     def __init__(self):
@@ -77,10 +85,16 @@ class ChromaEngine:
             base_url=self.base_url
         )
         
-        print(f"[+] ChromaEngine 初始化完成")
-        print(f"    - 数据库路径: {self.chroma_dir}")
+        # [核心节点]：混合检索重排模型配置
+        self.rerank_url = "https://api.siliconflow.cn/v1/rerank"
+        self.rerank_model = "BAAI/bge-reranker-v2-m3"
+        
+        print(f"[+] HybridSearchEngine 初始化完成")
+        print(f"    - 向量数据库路径: {self.chroma_dir}")
         print(f"    - 集合名称: {self.collection_name}")
         print(f"    - Embedding 模型: {self.embedding_model}")
+        print(f"    - 重排模型: {self.rerank_model}")
+        print(f"    - 检索架构: Dense(Chroma) + Sparse(BM25) + Reranking")
     
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(4))
     def _get_embedding(self, text: str) -> List[float]:
@@ -200,103 +214,280 @@ class ChromaEngine:
             # [核心节点]：物理缓冲，防止打穿 API QPS 限制
             time.sleep(0.5)
         
-        print(f"\n[+] 企业级知识切片向量化入库完成！")
+        # [核心节点]：BM25 双轨写入 - 构建关键词索引
+        print(f"\n[核心节点]：开始构建 BM25 关键词索引（双轨写入）")
+        try:
+            # [核心节点]：使用 jieba 对每条内容进行纯中文分词
+            tokenized_corpus = []
+            for chunk in knowledge_base:
+                tokens = jieba.lcut(chunk.content)
+                tokenized_corpus.append(tokens)
+            
+            # [核心节点]：实例化 BM25Okapi
+            bm25 = BM25Okapi(tokenized_corpus)
+            
+            # [核心节点]：确保专家目录存在
+            expert_bm25_dir = os.path.join(self.base_dir, "data", "experts", expert_id)
+            os.makedirs(expert_bm25_dir, exist_ok=True)
+            
+            # [核心节点]：物理保存 BM25 索引和原始切片数组
+            bm25_index_path = os.path.join(expert_bm25_dir, "bm25_index.pkl")
+            bm25_data = {
+                "bm25": bm25,
+                "corpus": [chunk.content for chunk in knowledge_base],
+                "metadata": [
+                    {
+                        "chunk_type": chunk.chunk_type,
+                        "citation_source": chunk.citation_source,
+                        "upstream_file": chunk.upstream_file if hasattr(chunk, 'upstream_file') else "",
+                        "doc_id": chunk.doc_id if hasattr(chunk, 'doc_id') else ""
+                    }
+                    for chunk in knowledge_base
+                ]
+            }
+            with open(bm25_index_path, 'wb') as f:
+                pickle.dump(bm25_data, f)
+            
+            print(f"    ✓ BM25 索引构建完成，已物理保存至: {bm25_index_path}")
+            print(f"    ✓ 索引包含 {len(tokenized_corpus)} 条分词文档")
+        except Exception as e:
+            print(f"[!] BM25 索引构建失败（非致命）: {e}")
+            print(f"[!] 向量检索仍可正常工作，仅关键词检索不可用")
+        
+        print(f"\n[+] 企业级知识切片入库完成！")
         print(f"    - 总切片数: {total_chunks}")
-        print(f"    - 数据库路径: {self.chroma_dir}（保持不变）")
-        print(f"    - 集合名称: {self.collection_name}")
-        print(f"    - Embedding 模型: BAAI/bge-m3（保持不变）")
+        print(f"    - 向量数据库: {self.chroma_dir}")
+        print(f"    - BM25索引: data/experts/{expert_id}/bm25_index.pkl")
+        print(f"    - Embedding 模型: BAAI/bge-m3")
+        print(f"    - 检索架构: Dense + Sparse 双轨并行")
     
-    def coarse_search(self, query: str, expert_id: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    def _rerank_documents(self, query: str, documents: List[str], top_n: int = 3) -> List[dict]:
         """
-        [核心节点]：企业级知识切片向量检索（多租户版本）
+        [核心节点]：调用 SiliconFlow 重排模型对文档进行交叉重排
+        
+        输入：
+            - query: 查询文本
+            - documents: 待重排的文档列表
+            - top_n: 返回前 N 个结果
+        输出：按相关性排序的文档列表，包含相关性分数
+        副作用：调用外部重排 API
+        
+        原理：使用 BGE-Reranker-V2-M3 模型对召回的候选文档进行精细排序
+        """
+        if not documents:
+            return []
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": self.rerank_model,
+                "query": query,
+                "documents": documents,
+                "top_n": top_n,
+                "return_documents": True
+            }
+            
+            print(f"[+] 正在调用重排模型: {self.rerank_model}")
+            response = requests.post(
+                self.rerank_url,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            reranked_docs = []
+            
+            for item in result.get("results", []):
+                reranked_docs.append({
+                    "index": item.get("index", 0),
+                    "text": item.get("document", ""),
+                    "score": item.get("relevance_score", 0.0)
+                })
+            
+            print(f"    ✓ 重排完成，返回 {len(reranked_docs)} 个结果")
+            return reranked_docs
+            
+        except Exception as e:
+            print(f"[!] 重排模型调用失败: {e}")
+            print(f"[!] 降级处理：返回原始顺序的前 {top_n} 个文档")
+            # [核心节点]：降级机制 - 网络错误时返回原顺序的 documents
+            return [{"index": i, "text": doc, "score": 0.0} for i, doc in enumerate(documents[:top_n])]
+    
+    def hybrid_search(self, query: str, expert_id: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """
+        [核心节点]：企业级混合检索（Dense + Sparse + Reranking）
         
         输入：
             - query: 自然语言查询文本
             - expert_id: 专家唯一标识（租户隔离过滤键）
             - top_k: 返回数量（B 端默认 3 条）
-        输出：最相关的知识切片列表，每个元素为包含 text 和 metadata 的字典
-        副作用：无
+        输出：经过三路混合检索和重排后的最相关知识切片列表
+        副作用：调用向量数据库、BM25 索引和重排模型
         
-        原理：将查询向量化，在向量空间中检索最相似的文本块
-              [核心节点]：强制使用 where={"expert_id": expert_id} 实现物理级别数据隔离
-              返回格式必须与 agent_engine.py 中的组装逻辑兼容
+        原理：
+            1. [第一路] Dense Retrieval：从 ChromaDB 向量空间召回 Top-20
+            2. [第二路] Sparse Retrieval：从 BM25 关键词索引召回 Top-20
+            3. [去重合流]：将两路召回结果合并去重
+            4. [交叉重排]：使用 BGE-Reranker 对候选集精细排序
+            5. 返回最终 Top-k 结果
+        
+        [核心节点]：任何一路报错都平滑降级到纯向量检索，确保系统可用性
         """
-        # [核心节点]：此处执行向量相似度检索
-        print(f"[+] 正在执行企业级知识切片检索: {query}")
+        print(f"\n[核心节点]：启动混合检索流程: {query}")
+        print(f"    - 专家 ID: {expert_id}")
+        print(f"    - 目标返回数: {top_k}")
         
-        # 获取查询向量
+        # [第一路]：Dense Retrieval（向量召回）
+        vector_candidates = []
         try:
+            print(f"[+] 第一路检索：Dense Retrieval (ChromaDB)")
             query_embedding = self._get_embedding(query)
-        except Exception as e:
-            print(f"[!] 查询向量化失败: {e}")
-            return []
-        
-        # 执行检索（多租户隔离）
-        try:
-            # [核心节点]：强制使用 expert_id 过滤，实现物理级别数据隔离
+            
             results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=top_k,
-                where={"expert_id": expert_id}  # [核心节点]：租户隔离过滤条件
+                n_results=20,  # 召回更多候选供重排
+                where={"expert_id": expert_id}
             )
-            print(f"[+] 专家 {expert_id} 向量检索完成")
+            
+            if results['ids'] and results['ids'][0]:
+                for i, doc_id in enumerate(results['ids'][0]):
+                    vector_candidates.append({
+                        "id": doc_id,
+                        "text": results['documents'][0][i] if results['documents'] else "",
+                        "metadata": results['metadatas'][0][i] if results['metadatas'] else {},
+                        "source": "vector"
+                    })
+            print(f"    ✓ 向量召回 {len(vector_candidates)} 个候选")
         except Exception as e:
             print(f"[!] 向量检索失败: {e}")
-            return []
+            print(f"[!] 继续尝试 BM25 检索...")
         
-        # [核心节点]：格式化结果 - 必须包含 text 和 metadata 键
-        formatted_results = []
-        if results['ids'] and results['ids'][0]:
-            for i, doc_id in enumerate(results['ids'][0]):
-                # [核心节点]：组装返回格式，与 agent_engine.py 兼容
-                result_item = {
-                    "id": doc_id,
-                    "text": results['documents'][0][i] if results['documents'] else "",
-                    "metadata": results['metadatas'][0][i] if results['metadatas'] else {},
-                    "distance": results['distances'][0][i] if results['distances'] else 0.0
-                }
-                formatted_results.append(result_item)
+        # [第二路]：Sparse Retrieval（BM25 关键词召回）
+        bm25_candidates = []
+        try:
+            print(f"[+] 第二路检索：Sparse Retrieval (BM25)")
+            bm25_index_path = os.path.join(self.base_dir, "data", "experts", expert_id, "bm25_index.pkl")
+            
+            if os.path.exists(bm25_index_path):
+                with open(bm25_index_path, 'rb') as f:
+                    bm25_data = pickle.load(f)
+                
+                bm25 = bm25_data["bm25"]
+                corpus = bm25_data["corpus"]
+                metadata_list = bm25_data["metadata"]
+                
+                # [核心节点]：使用 jieba 对 query 分词
+                query_tokens = jieba.lcut(query)
+                
+                # [核心节点]：BM25 检索 Top-20
+                bm25_scores = bm25.get_scores(query_tokens)
+                top_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:20]
+                
+                for idx in top_indices:
+                    bm25_candidates.append({
+                        "id": f"bm25_chunk_{idx}",
+                        "text": corpus[idx],
+                        "metadata": metadata_list[idx],
+                        "source": "bm25"
+                    })
+                print(f"    ✓ BM25 召回 {len(bm25_candidates)} 个候选")
+            else:
+                print(f"[!] BM25 索引文件不存在: {bm25_index_path}")
+        except Exception as e:
+            print(f"[!] BM25 检索失败: {e}")
+            print(f"[!] 继续合流向量结果...")
         
-        print(f"[+] 企业级知识切片检索完成，返回 {len(formatted_results)} 个结果")
-        return formatted_results
+        # [去重合流]：合并两路召回结果
+        print(f"[+] 候选合流与去重")
+        all_candidates = {}
+        
+        for candidate in vector_candidates + bm25_candidates:
+            text = candidate["text"]
+            if text not in all_candidates:
+                all_candidates[text] = candidate
+            else:
+                # 如果已存在，标记为双路召回
+                all_candidates[text]["source"] = "hybrid"
+        
+        dedup_candidates = list(all_candidates.values())
+        print(f"    ✓ 合并后共 {len(dedup_candidates)} 个唯一候选")
+        
+        # [交叉重排]：使用 Reranker 精细排序
+        reranked_results = []
+        if dedup_candidates:
+            try:
+                print(f"[+] 交叉重排：调用 BGE-Reranker-V2-M3")
+                documents = [c["text"] for c in dedup_candidates]
+                reranked = self._rerank_documents(query, documents, top_n=min(top_k, len(documents)))
+                
+                for item in reranked:
+                    idx = item["index"]
+                    if idx < len(dedup_candidates):
+                        result = dedup_candidates[idx].copy()
+                        result["rerank_score"] = item["score"]
+                        reranked_results.append(result)
+                
+                print(f"    ✓ 重排完成，返回 {len(reranked_results)} 个结果")
+            except Exception as e:
+                print(f"[!] 重排失败，使用原始顺序: {e}")
+                reranked_results = dedup_candidates[:top_k]
+        
+        # [健壮性降级]：如果混合检索无结果，降级到纯向量检索
+        if not reranked_results and vector_candidates:
+            print(f"[!] 混合检索无结果，降级到纯向量检索")
+            reranked_results = vector_candidates[:top_k]
+        
+        print(f"[+] 混合检索完成，最终返回 {len(reranked_results)} 个结果")
+        return reranked_results
 
 
 if __name__ == "__main__":
     """
-    主程序：执行企业级知识切片向量入库测试
+    主程序：执行企业级混合检索引擎测试
     """
     # [核心节点]：设置环境变量，实现架构回归
     os.environ["FORCE_ETL_REBUILD"] = "1"
     
     print("="*80)
-    print("企业级向量数据库引擎 - B端专家数字孪生系统")
+    print("企业级混合检索引擎 (Hybrid Search) - B端专家数字孪生系统")
+    print("架构: Dense(Chroma) + Sparse(BM25) + Reranking")
     print("="*80)
     
     try:
         # 初始化引擎
-        engine = ChromaEngine()
+        engine = HybridSearchEngine()
         
-        # [核心节点]：执行企业级知识切片入库
-        engine.upsert_full_corpus()
+        # 测试专家 ID
+        test_expert_id = "test_expert_001"
         
-        # 测试检索
+        # [核心节点]：执行企业级知识切片入库（含 BM25 双轨写入）
+        # engine.upsert_full_corpus(test_expert_id)
+        
+        # 测试混合检索
         print(f"\n{'='*80}")
-        print(f"测试企业级知识切片检索")
+        print(f"测试企业级混合检索 (Hybrid Search)")
         print(f"{'='*80}")
         
         test_query = "电脑故障"
-        search_results = engine.coarse_search(test_query, top_k=3)
+        search_results = engine.hybrid_search(test_query, expert_id=test_expert_id, top_k=3)
         
         print(f"\n查询: {test_query}")
         print(f"结果数: {len(search_results)}")
         for idx, result in enumerate(search_results, 1):
             print(f"\n--- 结果 {idx} ---")
-            print(f"相似度: {result['distance']:.4f}")
+            print(f"召回来源: {result.get('source', 'N/A')}")
+            print(f"重排分数: {result.get('rerank_score', 0.0):.4f}")
             print(f"切片类型: {result['metadata'].get('chunk_type', 'N/A')}")
             print(f"来源: {result['metadata'].get('citation_source', 'N/A')}")
             print(f"内容预览: {result['text'][:200]}...")
         
-        print(f"\n[+] 企业级向量数据库测试完成！")
+        print(f"\n[+] 企业级混合检索引擎测试完成！")
         
     except Exception as e:
         print(f"[!] 执行失败: {e}")

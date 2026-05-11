@@ -1,5 +1,5 @@
 # 📋 企业级专家数字孪生中台 - 项目快照
-**生成时间**: 2026-05-08 12:16:21
+**生成时间**: 2026-05-09 15:51:39
 **项目路径**: A:\Windsurf_project\AI identify2.0企业版
 
 ## 📂 项目目录结构
@@ -52,17 +52,6 @@ class ChunkType(str, Enum):
     BUSINESS_RULE = "BUSINESS_RULE"
 
 
-class BusinessIntent(str, Enum):
-    """
-    业务意图枚举
-    
-    用途：标识用户的业务意图类型，用于意图路由
-    """
-    TECHNICAL_SUPPORT = "TECHNICAL_SUPPORT"
-    SALES_PITCH = "SALES_PITCH"
-    CHIT_CHAT = "CHIT_CHAT"
-
-
 class UrgencyLevel(str, Enum):
     """
     紧急程度枚举
@@ -99,6 +88,43 @@ class DigitalTwinProfile(BaseModel):
         description="业务红线（禁止触碰的边界）",
         examples=["绝不承诺未发布的特性", "不得泄露客户敏感数据", "禁止提供未经授权的技术访问"]
     )
+    golden_few_shots: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="金牌示例对话，用于大模型 Few-Shot 模仿",
+        examples=[[{"user_input": "...", "expert_reply": "..."}]]
+    )
+    supported_intents: List[str] = Field(
+        default_factory=list,
+        description="专家支持的专属业务意图列表（如：病理问诊、用药指导、闲聊兜底）",
+        examples=[["病理问诊", "用药指导", "闲聊兜底"]]
+    )
+    
+    @field_validator('supported_intents')
+    @classmethod
+    def validate_supported_intents(cls, v: List[str]) -> List[str]:
+        """
+        租户专属意图列表验证
+        
+        输入：原始意图列表
+        输出：验证后的意图列表
+        副作用：无
+        
+        原理：确保意图列表至少包含3个意图，且必须包含兜底意图
+        """
+        if len(v) < 3:
+            raise ValueError(f"专家必须支持至少3个业务意图，当前仅有 {len(v)} 个: {v}")
+        
+        # 检查是否包含兜底意图
+        fallback_keywords = ['兜底', '其他', '闲聊', '杂项', '通用', '默认', 'misc', 'other', 'general']
+        has_fallback = any(
+            any(keyword in intent.lower() for keyword in fallback_keywords)
+            for intent in v
+        )
+        
+        if not has_fallback:
+            raise ValueError(f"专家意图列表必须包含兜底意图（如：闲聊兜底、其他咨询等），当前列表: {v}")
+        
+        return [intent.strip() for intent in v if intent.strip()]
     
     @field_validator('expert_name', 'domain_expertise')
     @classmethod
@@ -198,10 +224,10 @@ class ProbeState(BaseModel):
     
     用途：捕获当前用户的业务意图和紧急程度，用于专家模型路由决策
     """
-    business_intent: Literal["TECHNICAL_SUPPORT", "SALES_PITCH", "CHIT_CHAT"] = Field(
+    business_intent: str = Field(
         ...,
-        description="业务意图类型（必须是枚举值之一）",
-        examples=["TECHNICAL_SUPPORT", "SALES_PITCH", "CHIT_CHAT"]
+        description="业务意图类型（租户专属动态意图，由专家画像定义）",
+        examples=["病理问诊", "用药指导", "技术排障", "闲聊兜底"]
     )
     urgency_level: Literal["高", "中", "低"] = Field(
         ...,
@@ -230,11 +256,43 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 import uvicorn
 import os
+import sys
 import json
 import traceback
 from datetime import datetime
 
 from services.agent_engine import ExpertDigitalTwinAgent
+import glob
+
+# [核心节点]：动态加载默认专家ID（多租户架构）
+def get_default_expert_id() -> str:
+    """
+    从 data/experts/ 目录读取第一个专家ID作为默认启动专家
+    
+    输出：专家ID字符串
+    异常：如果目录为空，返回None
+    """
+    experts_dir = os.path.join(os.path.dirname(__file__), "data", "experts")
+    
+    if not os.path.exists(experts_dir):
+        return None
+    
+    # 获取所有子目录（专家目录）
+    expert_dirs = [d for d in os.listdir(experts_dir) 
+                   if os.path.isdir(os.path.join(experts_dir, d))]
+    
+    # 过滤掉空目录，优先选择非空目录
+    valid_experts = []
+    for expert_id in expert_dirs:
+        expert_path = os.path.join(experts_dir, expert_id)
+        if os.listdir(expert_path):  # 目录非空
+            valid_experts.append(expert_id)
+    
+    if not valid_experts:
+        return None
+    
+    # 返回第一个有效的专家ID
+    return valid_experts[0]
 
 # 确保日志目录存在
 LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
@@ -340,6 +398,34 @@ class ChatResponse(BaseModel):
     )
 
 
+class SwitchExpertRequest(BaseModel):
+    """切换专家请求契约"""
+    expert_id: str = Field(
+        ...,
+        description="目标专家的唯一标识符",
+        examples=["expert_20260508_183912", "zhuanjia_20260507_165342"]
+    )
+
+
+class SwitchExpertResponse(BaseModel):
+    """切换专家响应契约"""
+    success: bool = Field(
+        ...,
+        description="切换是否成功",
+        examples=[True, False]
+    )
+    message: str = Field(
+        ...,
+        description="切换结果消息",
+        examples=["专家切换成功", "专家不存在"]
+    )
+    expert_name: str = Field(
+        default="",
+        description="当前激活的专家名称",
+        examples=["金牌架构师", "资深法务"]
+    )
+
+
 # [核心节点]：初始化 FastAPI 企业级网关
 app = FastAPI(
     title="企业级专家数字孪生系统网关",
@@ -347,10 +433,22 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# [核心节点]：初始化全局 ExpertDigitalTwinAgent 实例
-print("[+] 正在初始化全局 ExpertDigitalTwinAgent...")
-agent = ExpertDigitalTwinAgent()
-print("[+] 全局 ExpertDigitalTwinAgent 初始化完成\n")
+# [核心节点]：初始化全局 ExpertDigitalTwinAgent 实例（多租户架构）
+print("[系统点火] 正在探测已炼丹的专家数据...")
+default_expert_id = get_default_expert_id()
+
+if not default_expert_id:
+    print("[错误] 未找到任何已炼丹的专家数据，请先运行 etl_pipeline.py")
+    print("[提示] 运行命令: python services/etl_pipeline.py")
+    sys.exit(1)
+
+print(f"[系统点火] 正在加载默认专家: {default_expert_id}")
+try:
+    agent = ExpertDigitalTwinAgent(expert_id=default_expert_id)
+    print(f"[系统点火] 专家 [{agent.expert_profile.expert_name}] 加载完成，系统准备就绪\n")
+except Exception as e:
+    print(f"[致命错误] 专家加载失败: {e}")
+    sys.exit(1)
 
 # [物理切除]：SillyTavern 适配器已物理删除
 # B 端企业系统不需要酒馆角色卡导出功能
@@ -448,6 +546,69 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
 
 
+@app.post(
+    "/api/v1/switch_expert",
+    response_model=SwitchExpertResponse,
+    summary="切换专家",
+    description="动态切换当前激活的专家，无需重启服务。接收 expert_id 参数，重新初始化 ExpertDigitalTwinAgent。",
+    tags=["多租户专家管理"]
+)
+async def switch_expert(request: SwitchExpertRequest):
+    """
+    切换专家接口 - 多租户架构核心功能
+    
+    允许指挥官在运行时切换不同专家（如从儿科切换到法律），无需重启服务。
+    全局变量 agent 被重新赋值为新的 ExpertDigitalTwinAgent 实例。
+    
+    Args:
+        request: 包含目标 expert_id 的请求体
+        
+    Returns:
+        SwitchExpertResponse: 切换结果，包含成功状态和当前专家名称
+    """
+    global agent
+    
+    try:
+        print(f"\n[多租户切换] 收到专家切换请求: {request.expert_id}")
+        
+        # 验证专家是否存在
+        experts_dir = os.path.join(os.path.dirname(__file__), "data", "experts")
+        target_expert_path = os.path.join(experts_dir, request.expert_id)
+        
+        if not os.path.exists(target_expert_path) or not os.listdir(target_expert_path):
+            print(f"[多租户切换] 专家不存在或目录为空: {request.expert_id}")
+            return SwitchExpertResponse(
+                success=False,
+                message=f"专家 '{request.expert_id}' 不存在或未完成炼丹，请检查 expert_id",
+                expert_name=agent.expert_profile.expert_name if agent else ""
+            )
+        
+        # [核心节点]：重新初始化全局 agent 实例
+        print(f"[多租户切换] 正在加载新专家: {request.expert_id}")
+        new_agent = ExpertDigitalTwinAgent(expert_id=request.expert_id)
+        
+        # 切换成功后才赋值给全局变量
+        agent = new_agent
+        
+        print(f"[多租户切换] 专家切换成功！当前专家: [{agent.expert_profile.expert_name}]")
+        
+        return SwitchExpertResponse(
+            success=True,
+            message=f"专家切换成功，当前以【{agent.expert_profile.expert_name}】身份应答",
+            expert_name=agent.expert_profile.expert_name
+        )
+        
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        print(f"[多租户切换] 切换失败:")
+        print(error_traceback)
+        return SwitchExpertResponse(
+            success=False,
+            message=f"专家切换失败: {str(e)}",
+            expert_name=agent.expert_profile.expert_name if agent else ""
+        )
+
+
 if __name__ == "__main__":
     print("=" * 80)
     print("启动 FastAPI 企业级专家数字孪生网关")
@@ -491,7 +652,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 from domain.models import DigitalTwinProfile, KnowledgeChunk, ProbeState
 from services.state_tracker import BusinessIntentProbe
 from services.memory_manager import AdvancedRetriever
-from services.vector_db_service import ChromaEngine
+from services.vector_db_service import HybridSearchEngine
 from services.expert_manager import ExpertManager, get_expert_manager
 
 
@@ -547,12 +708,12 @@ class ExpertDigitalTwinAgent:
         self.intent_probe = BusinessIntentProbe()
         print("[+] 业务意图探针初始化完成")
         
-        # [核心节点]：此处初始化向量数据库，实现记忆与灵魂的物理缝合
+        # [核心节点]：此处初始化混合检索引擎，实现 Dense + Sparse + Reranking 三路召回
         try:
-            self.vector_db = ChromaEngine()
-            print("[+] 向量数据库引擎初始化完成")
+            self.vector_db = HybridSearchEngine()
+            print("[+] 混合检索引擎初始化完成 (Dense + Sparse + Reranking)")
         except Exception as e:
-            print(f"[!] 向量数据库初始化失败: {e}")
+            print(f"[!] 混合检索引擎初始化失败: {e}")
             print("[!] 将降级使用传统检索器")
             self.vector_db = None
             self.retriever = AdvancedRetriever()
@@ -642,25 +803,38 @@ class ExpertDigitalTwinAgent:
         if session_history is None:
             session_history = []
         
-        # [核心节点]：第一步：业务意图分诊（替代情绪探针）
-        print(f"\n[步骤 1] 业务意图分诊 - 探针检测")
+        # [核心节点]：第一步：业务意图分诊（动态意图探针，传入专家画像）
+        print(f"\n[步骤 1] 业务意图分诊 - 动态意图探针检测")
         print(f"  用户输入: \"{user_input}\"")
         print(f"  短期记忆条数: {len(session_history)}")
-        probe_state = self.intent_probe.classify(user_input)
+        print(f"  当前专家: {self.expert_profile.expert_name}")
+        print(f"  专属意图列表: {self.expert_profile.supported_intents}")
+        # [核心节点]：传入专家画像，实现租户专属意图识别
+        probe_state = self.intent_probe.classify(user_input, self.expert_profile)
         business_intent = probe_state.business_intent
         urgency_level = probe_state.urgency_level
-        print(f"[+] 探针识别业务意图：{business_intent}")
-        print(f"[+] 探针判定紧急程度：{urgency_level}")
+        print(f"[动态探针] 识别业务意图：{business_intent}")
+        print(f"[动态探针] 判定紧急程度：{urgency_level}")
         print(f"  ✓ 使用传入温度参数: {temperature}（B 端场景禁止自动调节）")
         
-        # [核心节点]：第二步：记忆召回（RAG）
+        # [核心节点]：第二步：记忆召回（RAG），算力风控检查
         print(f"\n[步骤 2] 记忆召回 - 向量数据库检索")
         rag_memories = []
         rag_metadata = []
-        if self.vector_db:
+        
+        # [核心节点：算力风控机制]：判断是否为兜底意图，物理阻断向量检索
+        fallback_intent = self.expert_profile.supported_intents[-1] if self.expert_profile.supported_intents else "闲聊兜底"
+        is_fallback = (business_intent == fallback_intent)
+        
+        if is_fallback:
+            print(f"[算力风控] 识别为兜底意图 '{business_intent}'，已物理阻断向量检索")
+            print(f"[算力风控] 跳过向量数据库查询，节省算力消耗")
+            rag_memories = []
+        elif self.vector_db:
             try:
                 # [核心节点]：多租户隔离 - 传入 expert_id 进行过滤
-                rag_results = self.vector_db.coarse_search(
+                # [核心节点]：使用混合检索引擎 (Dense + Sparse + Reranking)
+                rag_results = self.vector_db.hybrid_search(
                     query=user_input, 
                     expert_id=self.expert_id,  # [核心节点]：租户隔离键
                     top_k=3
@@ -751,63 +925,106 @@ class ExpertDigitalTwinAgent:
     
     def _build_rag_system_prompt(self, probe_state: ProbeState, rag_memories: List[str]) -> str:
         """
-        [核心节点]：构建企业级专家数字孪生系统提示词
+        [核心节点]：构建企业级专家数字孪生系统提示词（含神经缝合与反机器味封印）
         
         输入：探针状态、召回的企业知识切片
         输出：完整的企业级系统提示词
         副作用：无
         
-        原理：将专家画像、业务意图、企业知识、业务红线组装成结构化 Prompt
+        原理：将专家画像、业务意图、企业知识、金牌示例、业务红线组装成结构化 Prompt
+              并在结尾强制注入反机器味红线，确保回复像真人一样自然
         """
-        profile = self.expert_profile
-        prompt_parts = []
-        
-        # [核心节点]：专家身份与专业领域
-        prompt_parts.append(f"# 专家角色: {profile.expert_name}")
-        prompt_parts.append(f"## 专业领域: {profile.domain_expertise}")
-        
-        # [核心节点]：沟通风格（从 language_features 演变为专业沟通规范）
-        if profile.communication_style:
-            prompt_parts.append("\n## 沟通风格:")
-            style = profile.communication_style
-            if style.get('tone'):
-                prompt_parts.append(f"- 语气基调: {style['tone']}")
-            if style.get('avg_response_length'):
-                prompt_parts.append(f"- 平均回复长度: {style['avg_response_length']} 字")
-            if style.get('preferred_greeting'):
-                prompt_parts.append(f"- 标准问候语: {style['preferred_greeting']}")
-        
-        # [核心节点]：业务红线（绝不可违反）
-        if profile.business_redlines:
-            prompt_parts.append("\n## 业务红线 (绝不可违反):")
-            for redline in profile.business_redlines:
-                prompt_parts.append(f"- {redline}")
-        
-        # [核心节点]：路由意图与紧急程度（替代情绪探针）
-        prompt_parts.append(f"\n## 路由意图: {probe_state.business_intent}")
-        prompt_parts.append(f"## 紧急程度: {probe_state.urgency_level}")
-        
-        # [核心节点]：企业知识切片参考
-        if rag_memories:
-            prompt_parts.append("\n## 企业知识切片参考（来自向量数据库召回）:")
-            for i, memory in enumerate(rag_memories, 1):
-                prompt_parts.append(f"\n### 知识切片 {i}:")
-                prompt_parts.append(memory)
-        
-        # [核心节点]：强化 RAG 降噪护栏
-        prompt_parts.append("\n[RAG 降噪护栏]：")
-        prompt_parts.append("1. 如果你认为上述检索到的知识切片与用户的业务查询毫无逻辑关联，请【绝对无视】它们")
-        prompt_parts.append("2. 基于你的专业领域常识回答，或明确告知用户无法回答该问题")
-        prompt_parts.append("3. 严禁强行缝合不相关的知识切片到回复中")
-        prompt_parts.append("4. B 端企业场景要求准确性优先，宁可承认不知道也不要编造")
-        
-        # [核心节点]：企业级任务指令
-        prompt_parts.append("\n## 任务:")
-        prompt_parts.append("你是一位专业的企业级数字孪生专家。基于以上专业画像、业务意图和企业知识，")
-        prompt_parts.append("以专业、准确、简洁的方式回应用户的业务咨询或技术报障。")
-        prompt_parts.append("回复必须：1) 符合业务红线 2) 基于可靠知识 3) 保持专业语气")
-        
-        return "\n".join(prompt_parts)
+        try:
+            print("[神经缝合] 开始组装企业级系统提示词...")
+            profile = self.expert_profile
+            prompt_parts = []
+            
+            # [核心节点]：专家身份与专业领域
+            prompt_parts.append(f"专家角色: {profile.expert_name}")
+            prompt_parts.append(f"专业领域: {profile.domain_expertise}")
+            
+            # [核心节点]：沟通风格（从 language_features 演变为专业沟通规范）
+            if profile.communication_style:
+                prompt_parts.append("\n沟通风格:")
+                style = profile.communication_style
+                if style.get('tone'):
+                    prompt_parts.append(f"- 语气基调: {style['tone']}")
+                if style.get('avg_response_length'):
+                    prompt_parts.append(f"- 平均回复长度: {style['avg_response_length']} 字")
+                if style.get('preferred_greeting'):
+                    prompt_parts.append(f"- 标准问候语: {style['preferred_greeting']}")
+            
+            # [核心节点]：业务红线（绝不可违反）
+            if profile.business_redlines:
+                prompt_parts.append("\n业务红线 (绝不可违反):")
+                for redline in profile.business_redlines:
+                    prompt_parts.append(f"- {redline}")
+            
+            # [核心节点]：路由意图与紧急程度（替代情绪探针）
+            prompt_parts.append(f"\n路由意图: {probe_state.business_intent}")
+            prompt_parts.append(f"紧急程度: {probe_state.urgency_level}")
+            
+            # [核心节点]：企业知识切片参考
+            if rag_memories:
+                prompt_parts.append("\n企业知识切片参考（来自混合检索召回）:")
+                for i, memory in enumerate(rag_memories, 1):
+                    prompt_parts.append(f"\n知识切片 {i}:")
+                    prompt_parts.append(memory)
+            
+            # [核心节点]：强化 RAG 降噪护栏
+            prompt_parts.append("\n[RAG 降噪护栏]：")
+            prompt_parts.append("如果你认为上述检索到的知识切片与用户的业务查询毫无逻辑关联，请【绝对无视】它们")
+            prompt_parts.append("基于你的专业领域常识回答，或明确告知用户无法回答该问题")
+            prompt_parts.append("严禁强行缝合不相关的知识切片到回复中")
+            prompt_parts.append("B 端企业场景要求准确性优先，宁可承认不知道也不要编造")
+            
+            # [核心节点]：企业级任务指令
+            prompt_parts.append("\n任务:")
+            prompt_parts.append("你是一位专业的企业级数字孪生专家。基于以上专业画像、业务意图和企业知识，")
+            prompt_parts.append("以专业、准确、简洁的方式回应用户的业务咨询或技术报障。")
+            prompt_parts.append("回复必须符合业务红线、基于可靠知识、保持专业语气")
+            
+            # [神经缝合]：在 Prompt 结尾强制注入金牌示例（Golden Few-Shots）
+            print("[神经缝合] 正在注入 Golden Few-Shots 进行语气校准...")
+            if profile.golden_few_shots and len(profile.golden_few_shots) > 0:
+                prompt_parts.append("\n金牌示例对话（必须完全模仿以下示例的语气、句式长短和标点习惯）:")
+                for i, shot in enumerate(profile.golden_few_shots[:3], 1):  # 最多取3个示例
+                    try:
+                        user_input = shot.get('user_input', '')
+                        expert_reply = shot.get('expert_reply', '')
+                        if user_input and expert_reply:
+                            prompt_parts.append(f"\n--- 示例 {i} ---")
+                            prompt_parts.append(f"[示例 Q]: {user_input}")
+                            prompt_parts.append(f"[示例 A]: {expert_reply}")
+                    except Exception as e:
+                        print(f"[神经缝合] 警告：组装第 {i} 个 few-shot 示例时出错: {e}")
+                        continue
+                print(f"[神经缝合] 成功注入 {min(len(profile.golden_few_shots), 3)} 个金牌示例")
+            else:
+                print("[神经缝合] 警告：专家画像中未找到 golden_few_shots，语气校准可能受限")
+            
+            # [终极反机器味红线]：在 Prompt 最后增加不可逾越的规则
+            print("[神经缝合] 正在封印反机器味红线...")
+            prompt_parts.append("\n" + "="*60)
+            prompt_parts.append("【格式与语气绝对红线 - 不可逾越】")
+            prompt_parts.append("="*60)
+            prompt_parts.append("1. 绝对禁止使用 Markdown 语法（严禁出现 **加粗** 和 1. 2. 3. 列表）！")
+            prompt_parts.append("""2. 绝对禁止使用"作为一名xxx专家"、"我建议"、"根据我的分析"等官腔废话！""")
+            prompt_parts.append("3. 必须完全吸收并模仿上方【示例 A】中的口语化语气、句式长短和标点习惯！")
+            prompt_parts.append("4. 用连续的自然段落回复，像真人一样对话，不要分段罗列！")
+            prompt_parts.append("""5. 严禁输出"总结："、"综上所述"、"希望以上信息对您有帮助"、"如果您还有其他问题"等AI味收尾！""")
+            prompt_parts.append("6. 直接回答问题，不要解释你的思考过程！")
+            prompt_parts.append("="*60)
+            
+            final_prompt = "\n".join(prompt_parts)
+            print(f"[神经缝合] 系统提示词组装完成，总长度: {len(final_prompt)} 字符")
+            return final_prompt
+            
+        except Exception as e:
+            print(f"[神经缝合] 致命错误：组装系统提示词时发生异常: {e}")
+            print(f"[神经缝合] 异常类型: {type(e).__name__}")
+            # 异常穿透：向上抛出，让上层处理
+            raise
 
 ```
 
@@ -815,13 +1032,13 @@ class ExpertDigitalTwinAgent:
 ```python
 """
 业务意图探针 - Business Intent Probe
-企业级前台分诊护士系统，基于 LLM 进行业务意图识别和紧急程度判断
+企业级语义分类引擎 (Semantic Routing Engine)，基于 LLM 进行业务意图识别和紧急程度判断
 """
 
 import json
 import traceback
 from typing import Optional
-from domain.models import ProbeState
+from domain.models import ProbeState, DigitalTwinProfile
 import openai
 from dotenv import load_dotenv
 import os
@@ -834,7 +1051,7 @@ class BusinessIntentProbe:
     """
     业务意图探针
     使用轻量级 LLM 对用户输入进行业务意图分诊和紧急程度判断
-    扮演"前台分诊护士"角色，精准识别用户需求
+    扮演高精度语义分类引擎，精准识别用户需求
     """
     
     def __init__(self):
@@ -845,33 +1062,41 @@ class BusinessIntentProbe:
         )
         self.model = "Qwen/Qwen2.5-7B-Instruct"
     
-    def classify(self, user_input: str) -> ProbeState:
+    def classify(self, user_input: str, expert_profile: DigitalTwinProfile) -> ProbeState:
         """
-        使用 LLM 对用户输入进行业务意图分类
+        [核心节点：动态意图探针] 使用 LLM 对用户输入进行租户专属业务意图分类
         
-        输入：用户输入文本
+        输入：
+            - user_input: 用户输入文本
+            - expert_profile: 专家画像（包含 supported_intents 租户专属意图列表）
         输出：经过 Pydantic 强校验的探针状态对象
-        副作用：如果分类失败，降级为默认值 CHIT_CHAT / 低
+        副作用：如果分类失败或意图不在支持列表中，降级为兜底意图
         
-        用途：判断用户的业务意图（技术支持、销售咨询、闲聊兜底）以及紧急程度
+        用途：基于专家画像的动态意图列表，精准识别用户业务意图和紧急程度
         """
-        system_prompt = """你是一个专业的企业前台分诊护士。请根据用户的话语，精准识别其业务意图和紧急程度，以便将其路由到对应的专家。
+        # [核心节点]：提取租户专属意图列表
+        intents = expert_profile.supported_intents
+        fallback_intent = intents[-1] if intents else "闲聊兜底"
+        
+        # [核心节点]：动态组装 System Prompt，将硬编码意图替换为专家专属意图
+        intents_list_str = "\n".join([f"- {intent}" for intent in intents])
+        
+        # [核心节点]：去人格化 Prompt，抽象紧急程度描述，解决领域偏见问题
+        system_prompt = f"""你是一个高精度的企业级语义分类引擎 (Semantic Routing Engine)。请根据用户的话语，精准识别其业务意图和紧急程度，以便将其路由到对应的专家。
 
-业务意图分类（必须选择其一）：
-- TECHNICAL_SUPPORT: 技术支持（如：系统报错、API故障、部署问题、数据库连接失败、性能问题等）
-- SALES_PITCH: 销售咨询（如：产品报价、购买咨询、合作洽谈、方案询问、功能介绍等）
-- CHIT_CHAT: 闲聊兜底（如：你好、在吗、谢谢、再见、其他非业务咨询等）
+【专家专属意图分类】（必须选择其一）：
+{intents_list_str}
 
 紧急程度分类（必须选择其一）：
-- 高: 高紧急（如：系统宕机、生产环境故障、严重安全问题、数据丢失等）
-- 中: 中等紧急（如：功能异常、影响业务但不致命的问题、性能下降等）
-- 低: 低紧急（如：一般咨询、日常问候、非紧急问题等）
+- 高: 严重阻断核心业务，或造成重大实际损失/生命财产威胁
+- 中: 业务部分受损，体验下降，但存在临时替代方案
+- 低: 常规信息咨询，无实质性损失
 
 请严格以纯 JSON 格式输出，不要包含任何其他文字说明，格式如下：
-{
+{{
     "business_intent": "业务意图",
     "urgency_level": "紧急程度"
-}"""
+}}"""
         
         try:
             # [核心节点]：此处调用轻量级 LLM 对用户 query 进行分诊路由
@@ -889,23 +1114,34 @@ class BusinessIntentProbe:
             result_text = response.choices[0].message.content
             result_dict = json.loads(result_text)
             
-            # [核心节点]：利用 Pydantic 物理拦截大模型捏造的非标准意图
+            # [核心节点]：Pydantic 降级防线 - 校验大模型输出的意图是否在支持列表中
+            detected_intent = result_dict.get("business_intent", fallback_intent)
+            urgency_level = result_dict.get("urgency_level", "低")
+            
+            # [核心节点]：意图合法性校验，防止大模型幻觉输出不存在的意图
+            if detected_intent not in intents:
+                print(f"[动态探针] 检测到非法意图 '{detected_intent}'，强制降级为兜底意图 '{fallback_intent}'")
+                detected_intent = fallback_intent
+            else:
+                print(f"[动态探针] 意图识别成功: {detected_intent}")
+            
             probe_state = ProbeState(
-                business_intent=result_dict.get("business_intent", "CHIT_CHAT"),
-                urgency_level=result_dict.get("urgency_level", "低"),
+                business_intent=detected_intent,
+                urgency_level=urgency_level,
                 confidence=1.0
             )
             
             return probe_state
             
         except Exception as e:
-            # [核心节点]：此处实现保底机制，降级为默认值
+            # [核心节点]：此处实现保底机制，降级为兜底意图
             print(f"[!] 业务意图探针分类失败: {e}")
             print(f"[!] 错误堆栈: {traceback.format_exc()}")
             
-            # 降级到默认值 CHIT_CHAT / 低
+            # [核心节点]：降级到兜底意图（最后一个意图）
+            print(f"[动态探针] 异常降级，使用兜底意图: {fallback_intent}")
             return ProbeState(
-                business_intent="CHIT_CHAT",
+                business_intent=fallback_intent,
                 urgency_level="低",
                 confidence=0.0
             )
@@ -920,7 +1156,18 @@ class BusinessIntentProbe:
 遵循企业级工程宪法的端云解耦原则
 
 [核心节点]：多租户专家池架构 - 支持动态切换不同专家
+
+【启动命令】（重要！避开 8501 端口冲突）
+    streamlit run web_ui.py --server.port 8502
+
+【如遇 8501 端口被占用】
+    1. 查找占用进程: netstat -ano | findstr :8501
+    2. 结束占用进程: taskkill /F /PID <PID>
+    3. 或直接换用 8502 端口启动
 """
+
+# [核心节点]：Streamlit 端口配置（避开 8501 冲突）
+# 建议启动命令: streamlit run web_ui.py --server.port 8502
 
 import streamlit as st
 import requests
@@ -1060,6 +1307,23 @@ def clear_system_trace():
 with st.sidebar:
     st.title("专家数字孪生系统 V1.0")
     st.markdown("---")
+    
+    # [核心节点]：端口配置提示（解决 8501 冲突问题）
+    with st.expander("⚙️ 端口配置", expanded=False):
+        st.info("""
+        **默认端口 8501 被占用？**
+        
+        使用以下命令启动：
+        ```bash
+        streamlit run web_ui.py --server.port 8502
+        ```
+        
+        或结束占用进程：
+        ```bash
+        netstat -ano | findstr :8501
+        taskkill /F /PID <PID>
+        ```
+        """)
     
     # [核心节点]：多租户专家档案室 - 动态专家选择
     st.markdown("### 🏢 专家档案室")
@@ -1367,7 +1631,7 @@ Reply → {len(trace['reply'])} 字符
 
 ### 📄 engineering_norms.md
 ```markdown
-# 《AI 微服务集群部署与运维法典 V2.0》
+# 《AI 架构工程宪法 V2.0》
 
 ## 1. 零回归与防腐层原则 (Zero-Regression & ACL)
 - 修复 Bug 或新增特性时，必须进行最小化修改，严禁重写稳定逻辑。
@@ -1490,15 +1754,20 @@ Reply → {len(trace['reply'])} 字符
 - 必须提供推理耗时监控图表
 - 必须支持日志清空功能
 
+## 7. 活文档与小白级说明书同步铁律 (Living Documentation)
+- **唯一入口：** 项目根目录下的 `README.md` 是本系统唯一的"小白级操作指南"。
+- **动态更新：** 任何涉及系统架构升级、端口变更、启动命令修改的操作，执行层 AI 必须**同步修改** `README.md`。
+- **零门槛原则：** `README.md` 必须拒绝堆砌晦涩术语。必须包含"如何一键启动"、"去哪里看监控大屏"、"如何导入数据"的傻瓜式（Step-by-Step）操作步骤，确保不懂代码的业务人员能从零上手。
+
+## 8. 面向指挥官的汉化交互原则 (Commander-Facing Localization)
+- 所有终端打印的日志、系统的报错提示、Web UI 的展现文案，必须 100% 使用专业、易懂的中文大白话。
+- 你在执行或者思考代码编写，架构升级过程中的流程语言也要使用中文确保指挥官读取。
+- 严禁在终端抛出未经捕获包装的纯英文 traceback 吓唬指挥官。异常必须被 try-except 捕获，并转化为如"[致命拦截] JSON 解析失败，已触发大模型自纠错..."等中文提示。
+
 ## 版本历史
 - v1.0 (2026-04-27): 初始版本，确立数据契约和工程规范
 - v2.0 (2026-04-28): 工业级重构，颁布零回归、Pydantic 护城河、数学+AI 双重过滤、彻底泛化解耦四大原则
 - v3.0 (2026-04-29): 新增 LLMOps 可观测性铁律，强制要求日志记录与监控大盘
 - v4.0 (2026-05-05): 剥离 C 端情感模块，全面转型 B 端企业专家数字孪生系统，升级意图路由与专业术语过滤机制
-
-## 7. 活文档与小白级说明书同步铁律 (Living Documentation)
-- **唯一入口：** 项目根目录下的 `README.md` 是本系统唯一的"小白级操作指南"。
-- **动态更新：** 任何涉及系统架构升级、端口变更、启动命令修改的操作，执行层 AI 必须**同步修改** `README.md`。
-- **零门槛原则：** `README.md` 必须拒绝堆砌晦涩术语。必须包含"如何一键启动"、"去哪里看监控大屏"、"如何导入数据"的傻瓜式（Step-by-Step）操作步骤，确保不懂代码的业务人员能从零上手。
 
 ```

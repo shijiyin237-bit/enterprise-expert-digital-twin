@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 from domain.models import DigitalTwinProfile, KnowledgeChunk, ProbeState
 from services.state_tracker import BusinessIntentProbe
 from services.memory_manager import AdvancedRetriever
-from services.vector_db_service import ChromaEngine
+from services.vector_db_service import HybridSearchEngine
 from services.expert_manager import ExpertManager, get_expert_manager
 
 
@@ -78,12 +78,12 @@ class ExpertDigitalTwinAgent:
         self.intent_probe = BusinessIntentProbe()
         print("[+] 业务意图探针初始化完成")
         
-        # [核心节点]：此处初始化向量数据库，实现记忆与灵魂的物理缝合
+        # [核心节点]：此处初始化混合检索引擎，实现 Dense + Sparse + Reranking 三路召回
         try:
-            self.vector_db = ChromaEngine()
-            print("[+] 向量数据库引擎初始化完成")
+            self.vector_db = HybridSearchEngine()
+            print("[+] 混合检索引擎初始化完成 (Dense + Sparse + Reranking)")
         except Exception as e:
-            print(f"[!] 向量数据库初始化失败: {e}")
+            print(f"[!] 混合检索引擎初始化失败: {e}")
             print("[!] 将降级使用传统检索器")
             self.vector_db = None
             self.retriever = AdvancedRetriever()
@@ -203,18 +203,44 @@ class ExpertDigitalTwinAgent:
         elif self.vector_db:
             try:
                 # [核心节点]：多租户隔离 - 传入 expert_id 进行过滤
-                rag_results = self.vector_db.coarse_search(
+                # [核心节点]：使用混合检索引擎 (Dense + Sparse + Reranking)
+                rag_results = self.vector_db.hybrid_search(
                     query=user_input, 
                     expert_id=self.expert_id,  # [核心节点]：租户隔离键
                     top_k=3
                 )
-                rag_memories = [result['text'] for result in rag_results]
+                
+                # [任务 1]：截留富文本遥测数据 - 构建高维度 trace_memories
+                rag_memories = [result['text'] for result in rag_results]  # 供 Prompt 使用
+                trace_memories = []  # 供遥测透传使用
+                
+                for result in rag_results:
+                    try:
+                        # 构建遥测字典，包含重排打分等硬核指标
+                        telemetry_item = {
+                            "text": result.get('text', ''),
+                            "score": result.get('rerank_score', 0.0),  # 重排打分，默认0.0
+                            "citation_source": result.get('metadata', {}).get('citation_source', '未知来源'),
+                            "chunk_type": result.get('metadata', {}).get('chunk_type', '未知类型')
+                        }
+                        trace_memories.append(telemetry_item)
+                    except Exception as e:
+                        print(f"[!] 构建遥测数据失败: {e}，使用默认值")
+                        trace_memories.append({
+                            "text": result.get('text', ''),
+                            "score": 0.0,
+                            "citation_source": '未知来源',
+                            "chunk_type": '未知类型'
+                        })
+                
                 rag_metadata = [result['metadata'] for result in rag_results]
-                print(f"[+] RAG 召回记忆条数：{len(rag_memories)}")
-                for i, (memory, meta) in enumerate(zip(rag_memories, rag_metadata), 1):
+                print(f"[+] RAG 混合检索召回记忆条数：{len(rag_memories)}")
+                print(f"[遥测透传] 已构建 {len(trace_memories)} 条富文本遥测数据")
+                for i, (memory, meta, trace) in enumerate(zip(rag_memories, rag_metadata, trace_memories), 1):
                     timestamp = meta.get('start_timestamp', '未知时间')
-                    print(f"    [{i}] 时间戳: {timestamp}")
-                    print(f"        内容节选: {memory[:50]}...")
+                    score = trace.get('score', 0.0)
+                    source = trace.get('citation_source', '未知来源')
+                    print(f"    [{i}] 重排得分: {score:.3f} | 来源: {source} | 内容节选: {memory[:50]}...")
             except Exception as e:
                 print(f"❌ [RAG 异常] {e}")
                 print(f"[!] 降级使用传统检索器")
@@ -282,90 +308,130 @@ class ExpertDigitalTwinAgent:
         print("生成回复链路完成")
         print(f"{'='*80}\n")
         
-        # [核心节点]：返回包含企业级中间态数据的字典
+        # [核心节点]：返回包含企业级中间态数据的字典（含富文本遥测）
         return {
             "reply": reply,
             "business_intent": business_intent,
             "urgency_level": urgency_level,
-            "retrieved_memories": rag_memories,
+            "retrieved_memories": trace_memories if 'trace_memories' in locals() else rag_memories,  # 优先返回富文本遥测
             "prompt_length": len(system_prompt),
             "generation_time": generation_time
         }
     
     def _build_rag_system_prompt(self, probe_state: ProbeState, rag_memories: List[str]) -> str:
         """
-        [核心节点]：构建企业级专家数字孪生系统提示词
+        [核心节点]：构建企业级专家数字孪生系统提示词（含神经缝合与反机器味封印）
         
         输入：探针状态、召回的企业知识切片
         输出：完整的企业级系统提示词
         副作用：无
         
-        原理：将专家画像、业务意图、企业知识、业务红线组装成结构化 Prompt
+        原理：将专家画像、业务意图、企业知识、金牌示例、业务红线组装成结构化 Prompt
+              并在结尾强制注入反机器味红线，确保回复像真人一样自然
         """
-        profile = self.expert_profile
-        prompt_parts = []
-        
-        # [核心节点]：专家身份与专业领域
-        prompt_parts.append(f"# 专家角色: {profile.expert_name}")
-        prompt_parts.append(f"## 专业领域: {profile.domain_expertise}")
-        
-        # [核心节点]：沟通风格（从 language_features 演变为专业沟通规范）
-        if profile.communication_style:
-            prompt_parts.append("\n## 沟通风格:")
-            style = profile.communication_style
-            if style.get('tone'):
-                prompt_parts.append(f"- 语气基调: {style['tone']}")
-            if style.get('avg_response_length'):
-                prompt_parts.append(f"- 平均回复长度: {style['avg_response_length']} 字")
-            if style.get('preferred_greeting'):
-                prompt_parts.append(f"- 标准问候语: {style['preferred_greeting']}")
-        
-        # [核心节点]：业务红线（绝不可违反）
-        if profile.business_redlines:
-            prompt_parts.append("\n## 业务红线 (绝不可违反):")
-            for redline in profile.business_redlines:
-                prompt_parts.append(f"- {redline}")
-        
-        # [核心节点：反机器味封印]：注入金牌示例对话，恢复语气模仿能力
-        if profile.golden_few_shots:
-            prompt_parts.append("\n## 【金牌示例】（必须完全模仿以下对话的语气、句式长短和标点习惯）:")
-            for i, shot in enumerate(profile.golden_few_shots[:3], 1):  # 最多取3个示例
-                user_input = shot.get('user_input', '')
-                expert_reply = shot.get('expert_reply', '')
-                if user_input and expert_reply:
-                    prompt_parts.append(f"\n### 示例 {i}:")
-                    prompt_parts.append(f"用户: {user_input}")
-                    prompt_parts.append(f"专家: {expert_reply}")
-        
-        # [核心节点]：路由意图与紧急程度（替代情绪探针）
-        prompt_parts.append(f"\n## 路由意图: {probe_state.business_intent}")
-        prompt_parts.append(f"## 紧急程度: {probe_state.urgency_level}")
-        
-        # [核心节点]：企业知识切片参考
-        if rag_memories:
-            prompt_parts.append("\n## 企业知识切片参考（来自向量数据库召回）:")
-            for i, memory in enumerate(rag_memories, 1):
-                prompt_parts.append(f"\n### 知识切片 {i}:")
-                prompt_parts.append(memory)
-        
-        # [核心节点]：强化 RAG 降噪护栏
-        prompt_parts.append("\n[RAG 降噪护栏]：")
-        prompt_parts.append("1. 如果你认为上述检索到的知识切片与用户的业务查询毫无逻辑关联，请【绝对无视】它们")
-        prompt_parts.append("2. 基于你的专业领域常识回答，或明确告知用户无法回答该问题")
-        prompt_parts.append("3. 严禁强行缝合不相关的知识切片到回复中")
-        prompt_parts.append("4. B 端企业场景要求准确性优先，宁可承认不知道也不要编造")
-        
-        # [核心节点]：企业级任务指令
-        prompt_parts.append("\n## 任务:")
-        prompt_parts.append("你是一位专业的企业级数字孪生专家。基于以上专业画像、业务意图和企业知识，")
-        prompt_parts.append("以专业、准确、简洁的方式回应用户的业务咨询或技术报障。")
-        prompt_parts.append("回复必须：1) 符合业务红线 2) 基于可靠知识 3) 保持专业语气")
-        
-        # [核心节点：反机器味格式红线]：最严厉的格式封印
-        prompt_parts.append("\n【反机器味格式红线】：")
-        prompt_parts.append("1. 绝对禁止使用 Markdown 语法（严禁使用 **加粗** 和 1. 2. 3. 列表）！")
-        prompt_parts.append('2. 绝对禁止使用"作为一名xxx专家"、"我建议"等官腔废话！')
-        prompt_parts.append("3. 必须完全吸收并模仿【金牌示例】中的语气、句式长短和标点习惯，直接用口语化的自然段落回复！")
-        prompt_parts.append('4. 严禁输出"总结："、"综上所述"、"希望以上信息对您有帮助"等AI味收尾！')
-        
-        return "\n".join(prompt_parts)
+        try:
+            print("[神经缝合] 开始组装企业级系统提示词...")
+            profile = self.expert_profile
+            prompt_parts = []
+            
+            # [核心节点]：专家身份与专业领域
+            prompt_parts.append(f"专家角色: {profile.expert_name}")
+            prompt_parts.append(f"专业领域: {profile.domain_expertise}")
+            
+            # [核心节点]：沟通风格（从 language_features 演变为专业沟通规范）
+            if profile.communication_style:
+                prompt_parts.append("\n沟通风格:")
+                style = profile.communication_style
+                if style.get('tone'):
+                    prompt_parts.append(f"- 语气基调: {style['tone']}")
+                if style.get('avg_response_length'):
+                    prompt_parts.append(f"- 平均回复长度: {style['avg_response_length']} 字")
+                if style.get('preferred_greeting'):
+                    prompt_parts.append(f"- 标准问候语: {style['preferred_greeting']}")
+                
+                # [核心节点]：金牌话术模板注入
+                scripts = style.get('standard_scripts', [])
+                if scripts:
+                    prompt_parts.append("\n金牌话术模板（请在适当场景中自然使用）:")
+                    for i, script in enumerate(scripts[:3], 1):  # 最多取3个话术模板
+                        prompt_parts.append(f"{i}. {script}")
+                    
+                    # [核心节点]：话术使用护栏 - 防止模式坍塌
+                    prompt_parts.append("\n【金牌话术使用红线】：")
+                    prompt_parts.append("1. 严禁生硬堆砌！你必须且只能在当前的【业务意图】和【上下文语境】绝对契合时，才能使用上述话术。")
+                    prompt_parts.append("2. 概率锁：在正常对话中，你有 80% 的概率完全不使用这些话术，必须使用你自己的自然语言回复。")
+                    prompt_parts.append("3. 频次锁：每次回复【最多】只能使用 1 句金牌话术，绝对禁止在一大段话中连发多句模板！")
+                    
+                    print(f"[神经缝合] 成功注入 {len(scripts)} 个金牌话术模板 + 使用护栏")
+            
+            # [核心节点]：业务红线（绝不可违反）
+            if profile.business_redlines:
+                prompt_parts.append("\n业务红线 (绝不可违反):")
+                for redline in profile.business_redlines:
+                    prompt_parts.append(f"- {redline}")
+            
+            # [核心节点]：路由意图与紧急程度（替代情绪探针）
+            prompt_parts.append(f"\n路由意图: {probe_state.business_intent}")
+            prompt_parts.append(f"紧急程度: {probe_state.urgency_level}")
+            
+            # [核心节点]：企业知识切片参考
+            if rag_memories:
+                prompt_parts.append("\n企业知识切片参考（来自混合检索召回）:")
+                for i, memory in enumerate(rag_memories, 1):
+                    prompt_parts.append(f"\n知识切片 {i}:")
+                    prompt_parts.append(memory)
+            
+            # [核心节点]：强化 RAG 降噪护栏
+            prompt_parts.append("\n[RAG 降噪护栏]：")
+            prompt_parts.append("如果你认为上述检索到的知识切片与用户的业务查询毫无逻辑关联，请【绝对无视】它们")
+            prompt_parts.append("基于你的专业领域常识回答，或明确告知用户无法回答该问题")
+            prompt_parts.append("严禁强行缝合不相关的知识切片到回复中")
+            prompt_parts.append("B 端企业场景要求准确性优先，宁可承认不知道也不要编造")
+            
+            # [核心节点]：企业级任务指令
+            prompt_parts.append("\n任务:")
+            prompt_parts.append("你是一位专业的企业级数字孪生专家。基于以上专业画像、业务意图和企业知识，")
+            prompt_parts.append("以专业、准确、简洁的方式回应用户的业务咨询或技术报障。")
+            prompt_parts.append("回复必须符合业务红线、基于可靠知识、保持专业语气")
+            
+            # [神经缝合]：在 Prompt 结尾强制注入金牌示例（Golden Few-Shots）
+            print("[神经缝合] 正在注入 Golden Few-Shots 进行语气校准...")
+            if profile.golden_few_shots and len(profile.golden_few_shots) > 0:
+                prompt_parts.append("\n金牌示例对话（必须完全模仿以下示例的语气、句式长短和标点习惯）:")
+                for i, shot in enumerate(profile.golden_few_shots[:3], 1):  # 最多取3个示例
+                    try:
+                        user_input = shot.get('user_input', '')
+                        expert_reply = shot.get('expert_reply', '')
+                        if user_input and expert_reply:
+                            prompt_parts.append(f"\n--- 示例 {i} ---")
+                            prompt_parts.append(f"[示例 Q]: {user_input}")
+                            prompt_parts.append(f"[示例 A]: {expert_reply}")
+                    except Exception as e:
+                        print(f"[神经缝合] 警告：组装第 {i} 个 few-shot 示例时出错: {e}")
+                        continue
+                print(f"[神经缝合] 成功注入 {min(len(profile.golden_few_shots), 3)} 个金牌示例")
+            else:
+                print("[神经缝合] 警告：专家画像中未找到 golden_few_shots，语气校准可能受限")
+            
+            # [终极反机器味红线]：在 Prompt 最后增加不可逾越的规则
+            print("[神经缝合] 正在封印反机器味红线...")
+            prompt_parts.append("\n" + "="*60)
+            prompt_parts.append("【格式与语气绝对红线 - 不可逾越】")
+            prompt_parts.append("="*60)
+            prompt_parts.append("1. 绝对禁止使用 Markdown 语法（严禁出现 **加粗** 和 1. 2. 3. 列表）！")
+            prompt_parts.append("""2. 绝对禁止使用"作为一名xxx专家"、"我建议"、"根据我的分析"等官腔废话！""")
+            prompt_parts.append("3. 必须完全吸收并模仿上方【示例 A】中的口语化语气、句式长短和标点习惯！")
+            prompt_parts.append("4. 用连续的自然段落回复，像真人一样对话，不要分段罗列！")
+            prompt_parts.append("""5. 严禁输出"总结："、"综上所述"、"希望以上信息对您有帮助"、"如果您还有其他问题"等AI味收尾！""")
+            prompt_parts.append("6. 直接回答问题，不要解释你的思考过程！")
+            prompt_parts.append("="*60)
+            
+            final_prompt = "\n".join(prompt_parts)
+            print(f"[神经缝合] 系统提示词组装完成，总长度: {len(final_prompt)} 字符")
+            return final_prompt
+            
+        except Exception as e:
+            print(f"[神经缝合] 致命错误：组装系统提示词时发生异常: {e}")
+            print(f"[神经缝合] 异常类型: {type(e).__name__}")
+            # 异常穿透：向上抛出，让上层处理
+            raise

@@ -55,6 +55,8 @@ class BusinessIntentProbe:
 【专家专属意图分类】（必须选择其一）：
 {intents_list_str}
 
+【绝对红线】：你输出的 business_intent 必须且只能是上方列表中的原词，一字不差！绝对禁止自己发明词汇！
+
 紧急程度分类（必须选择其一）：
 - 高: 严重阻断核心业务，或造成重大实际损失/生命财产威胁
 - 中: 业务部分受损，体验下降，但存在临时替代方案
@@ -86,12 +88,19 @@ class BusinessIntentProbe:
             detected_intent = result_dict.get("business_intent", fallback_intent)
             urgency_level = result_dict.get("urgency_level", "低")
             
-            # [核心节点]：意图合法性校验，防止大模型幻觉输出不存在的意图
-            if detected_intent not in intents:
+            # [核心节点]：重写意图合法性校验（引入模糊匹配）
+            matched_intent = None
+            for intent in intents:
+                if detected_intent in intent or intent in detected_intent:
+                    matched_intent = intent
+                    break
+            
+            if matched_intent:
+                detected_intent = matched_intent
+                print(f"[动态探针] 软匹配成功: {detected_intent}")
+            else:
                 print(f"[动态探针] 检测到非法意图 '{detected_intent}'，强制降级为兜底意图 '{fallback_intent}'")
                 detected_intent = fallback_intent
-            else:
-                print(f"[动态探针] 意图识别成功: {detected_intent}")
             
             probe_state = ProbeState(
                 business_intent=detected_intent,

@@ -49,8 +49,15 @@ class DigitalTwinProfile(BaseModel):
     domain_expertise: str = Field(..., description="专业领域", examples=["云计算架构", "企业法律合规", "售前咨询"])
     communication_style: Dict[str, Any] = Field(
         default_factory=dict,
-        description="沟通风格描述（从原有的 language_features 演变而来）",
-        examples=[{"tone": "专业严谨", "avg_response_length": 50, "preferred_greeting": "您好"}]
+        description="沟通风格描述（从原有的 language_features 演变而来），包含专家在业务中高频使用的金牌话术模板/口头禅",
+        examples=[
+            {
+                "tone": "专业严谨", 
+                "avg_response_length": 50, 
+                "preferred_greeting": "您好",
+                "standard_scripts": ["建议您尽快带孩子去医院做进一步检查", "这款目前库存紧张，建议先拍下锁单"]
+            }
+        ]
     )
     business_redlines: List[str] = Field(
         default_factory=list,

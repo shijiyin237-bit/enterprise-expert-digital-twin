@@ -22,6 +22,7 @@ import requests
 import os
 import sys
 import json
+import uuid
 from typing import List, Dict
 from datetime import datetime
 
@@ -40,6 +41,7 @@ st.set_page_config(
 
 # API 端点配置
 API_URL = "http://localhost:8088/api/v1/chat"
+TITLE_API_URL = "http://localhost:8088/api/v1/generate_title"
 LOG_FILE = os.path.join(os.path.dirname(__file__), "logs", "system_trace.log")
 
 # 初始化会话状态
@@ -48,6 +50,130 @@ if "messages" not in st.session_state:
 if "latest_trace" not in st.session_state:
     st.session_state.latest_trace = {}
 if "temperature" not in st.session_state:
+    st.session_state.temperature = 0.7
+if "current_expert_id" not in st.session_state:
+    st.session_state.current_expert_id = None
+if "current_session_id" not in st.session_state:
+    st.session_state.current_session_id = None
+if "session_title" not in st.session_state:
+    st.session_state.session_title = "新对话"
+
+# [核心节点]：会话数据管理函数
+def get_sessions_dir(expert_id: str) -> str:
+    """获取指定专家的会话目录路径"""
+    return os.path.join(os.path.dirname(__file__), "data", "sessions", expert_id)
+
+def save_session(expert_id: str, session_id: str, title: str, messages: List[Dict]):
+    """保存会话数据到文件"""
+    try:
+        sessions_dir = get_sessions_dir(expert_id)
+        os.makedirs(sessions_dir, exist_ok=True)
+        
+        session_file = os.path.join(sessions_dir, f"{session_id}.json")
+        session_data = {
+            "session_id": session_id,
+            "expert_id": expert_id,
+            "title": title,
+            "messages": messages,
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        with open(session_file, 'w', encoding='utf-8') as f:
+            json.dump(session_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"[会话保存] 专家 {expert_id} 会话 {session_id} 已保存")
+    except Exception as e:
+        print(f"[!] 会话保存失败: {e}")
+
+def load_session(expert_id: str, session_id: str) -> Dict:
+    """加载会话数据"""
+    try:
+        session_file = os.path.join(get_sessions_dir(expert_id), f"{session_id}.json")
+        
+        if not os.path.exists(session_file):
+            return {}
+        
+        with open(session_file, 'r', encoding='utf-8') as f:
+            session_data = json.load(f)
+        
+        print(f"[会话加载] 专家 {expert_id} 会话 {session_id} 已加载")
+        return session_data
+    except Exception as e:
+        print(f"[!] 会话加载失败: {e}")
+        return {}
+
+def get_session_list(expert_id: str) -> List[Dict]:
+    """获取专家的所有会话列表"""
+    try:
+        sessions_dir = get_sessions_dir(expert_id)
+        
+        if not os.path.exists(sessions_dir):
+            return []
+        
+        sessions = []
+        for filename in os.listdir(sessions_dir):
+            if filename.endswith('.json'):
+                session_file = os.path.join(sessions_dir, filename)
+                try:
+                    with open(session_file, 'r', encoding='utf-8') as f:
+                        session_data = json.load(f)
+                    
+                    # 获取文件修改时间
+                    file_mtime = os.path.getmtime(session_file)
+                    
+                    sessions.append({
+                        "session_id": session_data.get("session_id", ""),
+                        "title": session_data.get("title", "未命名会话"),
+                        "updated_at": datetime.fromtimestamp(file_mtime).isoformat(),
+                        "message_count": len(session_data.get("messages", []))
+                    })
+                except Exception as e:
+                    print(f"[!] 读取会话文件 {filename} 失败: {e}")
+                    continue
+        
+        # 按修改时间倒序排列
+        sessions.sort(key=lambda x: x["updated_at"], reverse=True)
+        return sessions
+    except Exception as e:
+        print(f"[!] 获取会话列表失败: {e}")
+        return []
+
+def generate_session_title(user_query: str) -> str:
+    """调用 API 生成会话标题"""
+    try:
+        response = requests.post(
+            TITLE_API_URL,
+            json={"user_query": user_query},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            title = result.get("title", "新对话")
+            print(f"[标题生成] API 返回标题: {title}")
+            return title
+        else:
+            print(f"[!] 标题生成 API 调用失败: {response.status_code}")
+            return "新对话"
+    except Exception as e:
+        print(f"[!] 标题生成请求失败: {e}")
+        return "新对话"
+
+def create_new_session(expert_id: str) -> str:
+    """创建新会话"""
+    session_id = str(uuid.uuid4())
+    st.session_state.current_session_id = session_id
+    st.session_state.session_title = "新对话"
+    st.session_state.messages = []
+    print(f"[会话创建] 专家 {expert_id} 新会话 {session_id}")
+    return session_id
+
+def load_session_to_ui(session_data: Dict):
+    """将会话数据加载到 UI 状态"""
+    st.session_state.messages = session_data.get("messages", [])
+    st.session_state.session_title = session_data.get("title", "未命名会话")
+    print(f"[会话加载] 已加载会话: {session_data.get('title', '未命名会话')}")
     st.session_state.temperature = 0.3  # [核心节点]：企业级场景要求确定性，低温设置
 if "frequency_penalty" not in st.session_state:
     st.session_state.frequency_penalty = 0.2
@@ -233,6 +359,57 @@ with st.sidebar:
     
     st.markdown("---")
     
+    # [核心节点]：历史会话管理
+    st.markdown("### 📜 历史会话")
+    
+    # 新建对话按钮
+    if st.button("➕ 新建对话", key="new_session", use_container_width=True):
+        if st.session_state.current_expert_id:
+            create_new_session(st.session_state.current_expert_id)
+            st.success("已创建新对话")
+            st.rerun()
+    
+    # 显示历史会话列表
+    if st.session_state.current_expert_id:
+        sessions = get_session_list(st.session_state.current_expert_id)
+        
+        if sessions:
+            st.caption(f"共 {len(sessions)} 个历史会话")
+            
+            for session in sessions[:10]:  # 最多显示 10 个
+                session_title = session['title']
+                session_time = datetime.fromisoformat(session['updated_at']).strftime("%m-%d %H:%M")
+                message_count = session['message_count']
+                
+                # 会话卡片
+                with st.container():
+                    col_title, col_meta = st.columns([3, 1])
+                    
+                    with col_title:
+                        if st.button(
+                            f"📝 {session_title}",
+                            key=f"session_{session['session_id']}",
+                            use_container_width=True,
+                            help=f"{message_count} 条消息"
+                        ):
+                            # 加载历史会话
+                            session_data = load_session(st.session_state.current_expert_id, session['session_id'])
+                            if session_data:
+                                load_session_to_ui(session_data)
+                                st.session_state.current_session_id = session['session_id']
+                                st.success(f"已加载会话: {session_title}")
+                                st.rerun()
+                    
+                    with col_meta:
+                        st.caption(f"{session_time}")
+                        st.caption(f"{message_count}条")
+                    
+                    st.divider()
+        else:
+            st.caption("暂无历史会话")
+    
+    st.markdown("---")
+    
     # [核心节点]：多页面路由 - B 端业务沙盘与 CTO 观测站
     page = st.radio(
         "选择视图",
@@ -262,6 +439,19 @@ if page == "🏢 B端业务沙盘":
         # 渲染用户消息
         with st.chat_message("user"):
             st.markdown(user_input)
+        
+        # [核心节点]：AI 标题生成 - 首条消息时触发
+        if (st.session_state.current_session_id is None or 
+            len(st.session_state.messages) == 1) and st.session_state.current_expert_id:
+            
+            # 创建新会话
+            session_id = create_new_session(st.session_state.current_expert_id)
+            
+            # 异步生成标题
+            with st.spinner("生成会话标题..."):
+                title = generate_session_title(user_input)
+                st.session_state.session_title = title
+                print(f"[标题生成] 新会话标题: {title}")
         
         # 准备短期记忆（最近 10 条）
         session_history = st.session_state.messages[-10:] if len(st.session_state.messages) > 10 else st.session_state.messages
@@ -305,6 +495,16 @@ if page == "🏢 B端业务沙盘":
                         "role": "assistant",
                         "content": reply
                     })
+                    
+                    # [核心节点]：实时保存会话数据
+                    if (st.session_state.current_session_id and 
+                        st.session_state.current_expert_id):
+                        save_session(
+                            expert_id=st.session_state.current_expert_id,
+                            session_id=st.session_state.current_session_id,
+                            title=st.session_state.session_title,
+                            messages=st.session_state.messages
+                        )
                     
                     # 强制刷新
                     st.rerun()
@@ -404,12 +604,34 @@ Reply → {len(trace['reply'])} 字符
             
             st.markdown("---")
             
-            # 节点 2: RAG 召回
-            st.markdown("#### [节点 2: RAG 召回]")
+            # 节点 2: RAG 召回 - 全息遥测可视化
+            st.markdown("#### [节点 2: RAG 召回] - 混合检索全息遥测")
             if trace['retrieved_memories']:
                 for i, memory in enumerate(trace['retrieved_memories'], 1):
-                    st.markdown(f"**记忆切片 {i}**:")
-                    st.code(memory, language="text")
+                    try:
+                        # 检测是否为富文本遥测数据
+                        if isinstance(memory, dict):
+                            # SOTA 级数据可视化渲染
+                            with st.expander(f"🎯 召回切片 {i} - 重排得分: {memory.get('score', 0.0):.3f}", expanded=True):
+                                col1, col2 = st.columns([3, 1])
+                                
+                                with col1:
+                                    st.markdown("**📝 知识内容**:")
+                                    st.code(memory.get('text', ''), language="text")
+                                
+                                with col2:
+                                    st.markdown("**📊 遥测指标**:")
+                                    st.metric("**[重排得分]**", f"{memory.get('score', 0.0):.3f}")
+                                    st.markdown(f"**[知识溯源]**: {memory.get('citation_source', '未知来源')}")
+                                    st.markdown(f"**[切片类型]**: {memory.get('chunk_type', '未知类型')}")
+                        else:
+                            # 向后兼容：纯文本格式
+                            with st.expander(f"📝 召回切片 {i} - 传统格式", expanded=False):
+                                st.code(memory, language="text")
+                                st.caption("⚠️ 传统格式，建议升级至混合检索引擎获取完整遥测数据")
+                    except Exception as e:
+                        st.error(f"⚠️ 渲染召回切片 {i} 时出错: {e}")
+                        st.code(str(memory), language="text")
             else:
                 st.warning("未触发历史记忆")
             
@@ -442,19 +664,56 @@ Reply → {len(trace['reply'])} 字符
         st.info("暂无系统日志数据")
     else:
         # [核心节点]：系统日志监控 - 展示业务意图和紧急程度而非情绪
-        st.dataframe(
-            logs,
-            column_config={
-                "timestamp": st.column_config.DatetimeColumn("时间戳", format="YYYY-MM-DD HH:mm:ss"),
-                "user_input": "用户输入",
-                "business_intent": "业务意图",
-                "urgency_level": "紧急程度",
-                "generation_time": st.column_config.NumberColumn("推理耗时(秒)", format="%.2f"),
-                "prompt_length": "Prompt长度",
-                "temperature": "温度"
-            },
-            use_container_width=True
-        )
+        try:
+            # 优化日志监控 DataFrame，确保不因字典格式报错
+            display_logs = []
+            for log in logs:
+                try:
+                    # 处理 retrieved_memories 字段，确保向后兼容
+                    memories = log.get('retrieved_memories', [])
+                    if memories and isinstance(memories, list) and len(memories) > 0:
+                        if isinstance(memories[0], dict):
+                            # 富文本格式：提取重排得分
+                            scores = [m.get('score', 0.0) for m in memories if isinstance(m, dict)]
+                            avg_score = sum(scores) / len(scores) if scores else 0.0
+                            memory_info = f"{len(memories)}条(重排:{avg_score:.3f})"
+                        else:
+                            # 纯文本格式
+                            memory_info = f"{len(memories)}条(传统)"
+                    else:
+                        memory_info = "0条"
+                    
+                    display_logs.append({
+                        "timestamp": log.get('timestamp', ''),
+                        "user_input": log.get('user_input', ''),
+                        "business_intent": log.get('business_intent', ''),
+                        "urgency_level": log.get('urgency_level', ''),
+                        "retrieved_memories": memory_info,  # 添加召回信息
+                        "generation_time": log.get('generation_time', 0),
+                        "prompt_length": log.get('prompt_length', 0),
+                        "temperature": log.get('temperature', 0)
+                    })
+                except Exception as e:
+                    print(f"[!] 处理日志条目时出错: {e}")
+                    continue
+            
+            st.dataframe(
+                display_logs,
+                column_config={
+                    "timestamp": st.column_config.DatetimeColumn("时间戳", format="YYYY-MM-DD HH:mm:ss"),
+                    "user_input": "用户输入",
+                    "business_intent": "业务意图",
+                    "urgency_level": "紧急程度",
+                    "retrieved_memories": st.column_config.TextColumn("RAG召回"),  # 新增召回列
+                    "generation_time": st.column_config.NumberColumn("推理耗时(秒)", format="%.2f"),
+                    "prompt_length": "Prompt长度",
+                    "temperature": "温度"
+                },
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"⚠️ 日志监控渲染失败: {e}")
+            st.dataframe(logs, use_container_width=True)  # 降级显示原始数据
         
         st.markdown("---")
         

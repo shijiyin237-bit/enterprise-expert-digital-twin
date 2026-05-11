@@ -12,6 +12,7 @@ import sys
 import json
 import traceback
 from datetime import datetime
+import openai
 
 from services.agent_engine import ExpertDigitalTwinAgent
 import glob
@@ -51,7 +52,7 @@ LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOGS_DIR, "system_trace.log")
 
-def write_system_trace(user_input: str, business_intent: str, urgency_level: str, retrieved_memories: List[str], reply: str, generation_time: float, prompt_length: int, temperature: float):
+def write_system_trace(user_input: str, business_intent: str, urgency_level: str, retrieved_memories: List, reply: str, generation_time: float, prompt_length: int, temperature: float):
     """
     写入系统追踪日志
     
@@ -133,10 +134,13 @@ class ChatResponse(BaseModel):
         description="紧急程度判定结果：高(系统故障/业务中断)、中(功能异常)、低(一般咨询)",
         examples=["高", "中", "低"]
     )
-    retrieved_memories: list = Field(
+    retrieved_memories: List = Field(
         default_factory=list,
-        description="RAG 召回的企业级知识切片文本，用于 CTO 白盒监控",
-        examples=[["Q: 502 错误如何排查？A: 检查后端服务状态..."]]
+        description="RAG 召回的企业级知识切片（富文本遥测数据），包含重排得分、知识溯源、切片类型等硬核指标，用于 CTO 全息监控",
+        examples=[
+            [{"text": "502 错误如何排查？", "score": 0.85, "citation_source": "运维手册", "chunk_type": "QA_PAIR"}],
+            ["Q: 502 错误如何排查？A: 检查后端服务状态..."]  # 向后兼容
+        ]
     )
     prompt_length: int = Field(
         default=0,
@@ -173,8 +177,26 @@ class SwitchExpertResponse(BaseModel):
     )
     expert_name: str = Field(
         default="",
-        description="当前激活的专家名称",
-        examples=["金牌架构师", "资深法务"]
+        description="切换后的专家名称",
+        examples=["金牌架构师", "资深法务顾问"]
+    )
+
+
+class TitleRequest(BaseModel):
+    """标题生成请求契约"""
+    user_query: str = Field(
+        ...,
+        description="用户输入的查询内容，用于生成会话标题",
+        examples=["服务器一直报 502 错误怎么排查？", "请问企业版 API 额度如何计费？"]
+    )
+
+
+class TitleResponse(BaseModel):
+    """标题生成响应契约"""
+    title: str = Field(
+        ...,
+        description="生成的会话标题，极简不超过6个字",
+        examples=["服务器502报错", "API额度计费", "产品功能咨询"]
     )
 
 
@@ -359,6 +381,61 @@ async def switch_expert(request: SwitchExpertRequest):
             message=f"专家切换失败: {str(e)}",
             expert_name=agent.expert_profile.expert_name if agent else ""
         )
+
+
+@app.post("/api/v1/generate_title", response_model=TitleResponse)
+async def generate_title(request: TitleRequest):
+    """
+    生成会话标题 API
+    
+    输入：用户查询内容
+    输出：简洁的会话标题（不超过6个字）
+    
+    原理：调用大模型生成概括性标题，用于会话管理
+    """
+    try:
+        # 初始化 OpenAI 客户端
+        client = openai.OpenAI(
+            api_key=os.getenv("SILICONFLOW_API_KEY"),
+            base_url=os.getenv("BASE_URL")
+        )
+        
+        # 构建标题生成 Prompt
+        prompt = f"你是一个标题生成器。请根据用户的这句话，生成一个简洁的概括性标题（要求：极简，绝对不要超过 6 个字，不要标点符号）。用户原话：{request.user_query}"
+        
+        # 调用大模型生成标题
+        response = client.chat.completions.create(
+            model="Qwen/Qwen2.5-7B-Instruct",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=20
+        )
+        
+        # 提取生成的标题
+        title = response.choices[0].message.content.strip()
+        
+        # 清理标题：移除多余空格和标点
+        title = title.replace(" ", "").replace("。", "").replace("？", "").replace("！", "").replace("、", "")
+        
+        # 确保标题不超过6个字
+        if len(title) > 6:
+            title = title[:6]
+        
+        print(f"[标题生成] 用户原话: {request.user_query}")
+        print(f"[标题生成] 生成标题: {title}")
+        
+        return TitleResponse(title=title)
+        
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        print(f"[标题生成] 生成失败:")
+        print(error_traceback)
+        
+        # 降级返回默认标题
+        default_title = "新对话"
+        return TitleResponse(title=default_title)
 
 
 if __name__ == "__main__":
