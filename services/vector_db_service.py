@@ -65,14 +65,14 @@ class HybridSearchEngine:
         # 初始化 ChromaDB 客户端
         self.client = chromadb.PersistentClient(path=self.chroma_dir)
         
-        # 创建或获取集合
-        self.collection_name = "full_corpus_memory"
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"description": "全量原始语料向量库"}
-        )
+        # [核心节点]：集合级物理隔离已启用
+        # 不再创建全局 full_corpus_memory 集合
+        # 改为通过 _get_expert_collection(expert_id) 动态创建/获取专家专属集合
+        self.collection_name = None
+        self.collection = None
         
         # 初始化 Embedding 客户端
+
         self.api_key = os.getenv("SILICONFLOW_API_KEY")
         self.base_url = os.getenv("BASE_URL", "https://api.siliconflow.cn/v1")
         self.embedding_model = "BAAI/bge-m3"
@@ -121,7 +121,24 @@ class HybridSearchEngine:
             print(f"[!] Embedding 调用失败，触发自动重试: {e}")
             raise
     
+    def _get_expert_collection(self, expert_id: str):
+        """
+        [核心节点]：根据专家 ID 动态获取/创建物理隔离的向量集合
+        ChromaDB 集合命名规范：3-63 字符，只允许字母、数字、下划线和连字符
+        """
+        import re
+        clean_id = re.sub(r'[^a-zA-Z0-9_-]', '_', expert_id)
+        collection_name = f"expert_{clean_id}_memory"
+        if len(collection_name) > 63:
+            collection_name = collection_name[:63]
+        
+        return self.client.get_or_create_collection(
+            name=collection_name,
+            metadata={"description": f"专家 {expert_id} 的物理隔离向量知识库"}
+        )
+    
     def upsert_full_corpus(self, expert_id: str, knowledge_base: List[KnowledgeChunk] = None):
+
         """
         [核心节点]：企业级知识切片向量化入库（多租户版本）
         
@@ -153,12 +170,17 @@ class HybridSearchEngine:
             print(f"[!] 知识库为空，跳过入库")
             return
         
+        # [核心节点]：动态获取专家专属集合（集合级物理隔离）
+        collection = self._get_expert_collection(expert_id)
+        
         print(f"\n{'='*80}")
         print(f"[核心节点]：开始企业级知识切片向量化入库")
         print(f"{'='*80}")
         print(f"[+] 知识切片总数: {len(knowledge_base)}")
+        print(f"[+] 目标集合: expert_{expert_id}_memory (物理隔离)")
         
         # [核心节点]：批量入库
+
         batch_size = 10
         total_chunks = len(knowledge_base)
         
@@ -197,10 +219,10 @@ class HybridSearchEngine:
                     "doc_id": chunk.doc_id if hasattr(chunk, 'doc_id') else ""
                 })
             
-            # 批量插入
+            # 批量插入（写入专家专属集合）
             if embeddings:
                 try:
-                    self.collection.add(
+                    collection.add(
                         ids=ids[:len(embeddings)],
                         embeddings=embeddings,
                         documents=documents[:len(embeddings)],
@@ -210,6 +232,7 @@ class HybridSearchEngine:
                 except Exception as e:
                     print(f"[!] 批量入库失败: {e}")
                     continue
+
             
             # [核心节点]：物理缓冲，防止打穿 API QPS 限制
             time.sleep(0.5)
@@ -344,16 +367,19 @@ class HybridSearchEngine:
         print(f"    - 目标返回数: {top_k}")
         
         # [第一路]：Dense Retrieval（向量召回）
+        # [核心节点]：动态获取专家专属集合（集合级物理隔离）
+        collection = self._get_expert_collection(expert_id)
         vector_candidates = []
         try:
             print(f"[+] 第一路检索：Dense Retrieval (ChromaDB)")
             query_embedding = self._get_embedding(query)
             
-            results = self.collection.query(
+            results = collection.query(
                 query_embeddings=[query_embedding],
                 n_results=20,  # 召回更多候选供重排
                 where={"expert_id": expert_id}
             )
+
             
             if results['ids'] and results['ids'][0]:
                 for i, doc_id in enumerate(results['ids'][0]):

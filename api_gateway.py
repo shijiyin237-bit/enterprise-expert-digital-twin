@@ -54,13 +54,7 @@ LOG_FILE = os.path.join(LOGS_DIR, "system_trace.log")
 
 def write_system_trace(user_input: str, business_intent: str, urgency_level: str, retrieved_memories: List, reply: str, generation_time: float, prompt_length: int, temperature: float):
     """
-    写入系统追踪日志
-    
-    输入：用户输入、业务意图、紧急程度、RAG记忆、回复、耗时、Prompt长度、温度
-    输出：无
-    副作用：追加写入日志文件
-    
-    原理：将本次对话的关键信息以 JSONL 格式写入日志文件，用于业务意图追踪和紧急事件审计
+    [强力防坍塌重构] 写入系统追踪日志
     """
     log_entry = {
         "timestamp": datetime.now().isoformat(),
@@ -73,8 +67,13 @@ def write_system_trace(user_input: str, business_intent: str, urgency_level: str
         "prompt_length": prompt_length,
         "temperature": temperature
     }
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    try:
+        # [核心节点]： Windows 平台下强力 I/O 护栏，防止并发冲突击穿网关
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[!] 警告：系统追踪日志写入失败（可能由于 Windows 并发文件锁冲突），已物理拦截异常，网关平稳运行。原因: {e}")
+
 
 
 # Pydantic 契约定义

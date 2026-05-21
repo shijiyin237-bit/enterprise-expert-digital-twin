@@ -54,66 +54,79 @@ def print_banner():
 def run_ingestion_phase():
     """
     [核心节点]：步骤 1 - 数据探针清洗阶段（低成本，可随意运行）
-    调用通用接入智能体进行数据结构嗅探和归一化
-    绝不自动执行 ETL（灵魂蒸馏）阶段以节省 Token
+    
+    [物理旁路改造 v2.0]：
+    1. 优先检测 data/staging/demo_staging.jsonl（ShareGPT 暴力拆解产物）
+    2. 如果存在，直接返回 True，跳过 UniversalIngestor
+    3. 如果不存在，尝试调用 sharegpt_to_jsonl.py 进行暴力拆解
+    4. 如果仍然失败，降级调用通用接入智能体（旧逻辑）
     """
     print("\n[步骤 1/3] 🔍 数据探针清洗 - Ingestion Phase")
     print("-" * 80)
     
-    # [核心节点]：检查源数据文件是否存在
+    # ============================================================
+    # [物理旁路]：优先检测 demo_staging.jsonl（ShareGPT 暴力拆解产物）
+    # ============================================================
+    demo_staging = Path("data/staging/demo_staging.jsonl")
+    if demo_staging.exists():
+        line_count = sum(1 for _ in demo_staging.open(encoding='utf-8'))
+        print(f"[✓] 检测到 ShareGPT 暴力拆解产物: {demo_staging}")
+        print(f"[✓] 数据已就绪: {line_count} 条记录")
+        print(f"[✓] 跳过 UniversalIngestor，直接放行进入 ETL 炼油厂")
+        return True
+    
+    # ============================================================
+    # [物理旁路]：尝试调用 sharegpt_to_jsonl.py 进行暴力拆解
+    # ============================================================
     source_file = Path("data/raw/source_data.csv")
-    if not source_file.exists():
+    if source_file.exists():
+        print(f"[✓] 找到源数据文件: {source_file}")
+        print("[探针清洗] 调用 ShareGPT 暴力拆解转换器...")
+        print("-" * 80)
+        
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", 
+                 "from tools.sharegpt_to_jsonl import convert_csv_to_jsonl; "
+                 "convert_csv_to_jsonl('data/raw/source_data.csv', 'data/staging/demo_staging.jsonl')"],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                env=ENV_UTF8,
+                cwd=str(Path(__file__).parent)
+            )
+            
+            if result.stdout:
+                print(result.stdout)
+            
+            # 检查是否成功生成
+            if demo_staging.exists():
+                line_count = sum(1 for _ in demo_staging.open(encoding='utf-8'))
+                print(f"[✓] ShareGPT 暴力拆解成功: {line_count} 条记录")
+                return True
+            else:
+                print(f"[!] ShareGPT 暴力拆解失败，降级到 UniversalIngestor")
+                if result.stderr:
+                    print(f"[!] 错误: {result.stderr[:500]}")
+        except Exception as e:
+            print(f"[!] ShareGPT 转换异常: {type(e).__name__}: {e}")
+            print("[!] 降级到 UniversalIngestor...")
+    else:
         print(f"[!] 源数据文件不存在: {source_file}")
         print("[提示] 请将脏数据文件放置在 data/raw/ 目录下")
         print("[提示] 支持的文件格式: .csv, .jsonl, .xlsx")
         print("[示例] 将 source_data.csv 放入 data/raw/ 目录")
-        return False
     
-    print(f"[✓] 找到源数据文件: {source_file}")
-    print("[探针清洗] 调用通用接入智能体嗅探数据结构...")
-    print("-" * 80)
-    
-    try:
-        # [核心节点]：只执行通用接入智能体（低成本），绝不自动执行 ETL（高成本）
-        result = subprocess.run(
-            [sys.executable, "-c", 
-             "from tools.universal_ingestor import main; main()" if Path("tools/universal_ingestor.py").exists() 
-             else "from tools.local_corpus_parser import main; main()"],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            env=ENV_UTF8,
-            cwd=str(Path(__file__).parent)
-        )
-        
-        if result.stdout:
-            print(result.stdout)
-        
-        if result.returncode != 0:
-            print(f"[!] 数据清洗阶段异常: {result.returncode}")
-            if result.stderr:
-                print(f"[!] 错误: {result.stderr[:500]}")
-            return False
-        
-        # [核心节点]：检查暂存区数据是否生成（从 .env 读取 LATEST_STAGING_FILE）
-        from dotenv import load_dotenv
-        load_dotenv()
-        latest_staging = os.getenv("LATEST_STAGING_FILE")
-        
-        if latest_staging and Path(latest_staging).exists():
-            staging_file = Path(latest_staging)
-            line_count = sum(1 for _ in staging_file.open(encoding='utf-8'))
-            print(f"[✓] 暂存区数据已生成: {staging_file} ({line_count} 条记录)")
-            return True
-        else:
-            print(f"[!] 暂存区数据未生成或 .env 未更新")
-            print(f"[!] 请检查 LATEST_STAGING_FILE: {latest_staging}")
-            return False
-        
-    except Exception as e:
-        print(f"[!] 数据清洗阶段失败: {type(e).__name__}: {e}")
-        return False
+    # ============================================================
+    # [降级方案]：旧逻辑已物理切除（universal_ingestor / local_corpus_parser 已废弃）
+    # ============================================================
+    print("[!] 数据探针清洗失败：未找到可用的暂存数据")
+    print("[!] 请确保 data/staging/demo_staging.jsonl 存在")
+    print("[!] 或先运行 tools/sharegpt_to_jsonl.py 生成暂存文件")
+    return False
+
+
 
 
 def prompt_etl_confirmation():
@@ -196,13 +209,12 @@ def start_backend():
         # [核心节点]：显式声明编码和环境变量防止 Windows 编码冲突
         backend_process = subprocess.Popen(
             [sys.executable, "api_gateway.py"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             text=True,
             encoding='utf-8',
             errors='replace',
             env=ENV_UTF8
         )
+
         
         print(f"[✓] 后端网关启动中 (PID: {backend_process.pid})")
         return backend_process
@@ -223,14 +235,15 @@ def start_frontend():
         # 使用 subprocess.Popen 非阻塞启动
         # [核心节点]：显式声明编码和环境变量防止 Windows 编码冲突
         frontend_process = subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", "web_ui.py", "--server.port", "8501"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            [sys.executable, "-m", "streamlit", "run", "web_ui.py", 
+             "--server.port", "8501", 
+             "--server.headless", "true"],  # [核心修复]：阉割框架自动弹窗，防止双开
             text=True,
             encoding='utf-8',
             errors='replace',
             env=ENV_UTF8
         )
+
         
         print(f"[✓] 前端界面启动中 (PID: {frontend_process.pid})")
         return frontend_process

@@ -370,6 +370,14 @@ class ExpertDigitalTwinAgent:
                 for redline in profile.business_redlines:
                     prompt_parts.append(f"- {redline}")
             
+            # [核心节点]：注入专家思维链 (CoT) SOP - 反模式坍塌机制
+            if getattr(profile, 'reasoning_logic', None) and len(profile.reasoning_logic) > 0:
+                prompt_parts.append("\n【专家专属思考链路 (CoT)】:")
+                prompt_parts.append("在生成回复前，你必须在内心中严格遵循以下 SOP 步骤进行推演（注意：不要向用户输出你的思考过程，直接输出符合你语气的最终回复）：")
+                for i, step in enumerate(profile.reasoning_logic, 1):
+                    prompt_parts.append(f"{i}. {step}")
+                print(f"[神经缝合] 成功注入 {len(profile.reasoning_logic)} 步业务思维链 SOP")
+            
             # [核心节点]：路由意图与紧急程度（替代情绪探针）
             prompt_parts.append(f"\n路由意图: {probe_state.business_intent}")
             prompt_parts.append(f"紧急程度: {probe_state.urgency_level}")

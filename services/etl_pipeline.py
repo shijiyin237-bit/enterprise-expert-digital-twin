@@ -36,10 +36,8 @@ from domain.models import DigitalTwinProfile, KnowledgeChunk
 from services.expert_manager import ExpertManager, get_expert_manager
 from services.vector_db_service import HybridSearchEngine
 
-# [核心节点]：通用数据接入智能体 - 用于自动嗅探数据结构
-from tools.universal_ingestor import UniversalIngestionAgent
-
 # 加载环境变量
+
 load_dotenv()
 
 # [核心节点]：全局 LLM 超时配置 - 防止网络阻塞导致假死
@@ -918,7 +916,13 @@ class DigitalTwinDistiller:
    - 示例：["病理问诊", "用药指导", "检查报告解读", "其他咨询"]
    - [核心节点]：意图名称要简洁专业，体现租户业务特色，严禁通用意图如"技术支持"
 
+8. reasoning_logic (专家业务推理SOP)
+   - 根据对话反向推导出的该专家处理业务的"通用思考链路"（3-5步）。
+   - 必须体现专家的深层业务逻辑，而不是表层对话。
+   - 示例：["第一步：倾听并共情用户的情绪", "第二步：排查是否存在物理损坏或操作不当", "第三步：明确给出退换货或维修的终极方案"]
+
 【提取示例红线】：在提取 golden_few_shots 时，必须像外科手术一样精确分离！
+
 - 正确示例：{{"user_input": "孩子发烧39度怎么办？", "expert_reply": "建议立即物理降温并就医"}}
 - 错误示例（严禁）：{{"user_input": "用户问孩子发烧怎么办，专家回答建议就医", "expert_reply": ""}} —— 这是严重错误！
 - 错误示例（严禁）：{{"user_input": "孩子发烧39度怎么办？建议立即物理降温", "expert_reply": "孩子发烧39度怎么办？建议立即物理降温"}} —— 这是复读机错误！
@@ -946,6 +950,7 @@ class DigitalTwinDistiller:
         "standard_scripts": ["金牌话术模板1", "金牌话术模板2", "金牌话术模板3"]
     }},
     "business_redlines": ["业务红线1", "业务红线2"],
+    "reasoning_logic": ["第一步：倾听并共情用户的情绪", "第二步：排查是否存在物理损坏或操作不当", "第三步：明确给出退换货或维修的终极方案"],
     "golden_few_shots": [
         {{
             "user_input": "典型用户提问（必须是客户原话，严禁包含专家回答）",
@@ -955,13 +960,16 @@ class DigitalTwinDistiller:
     "supported_intents": ["意图1", "意图2", "意图3", "闲聊兜底"]
 }}
 
+
 【输出要求】：
 1. 必须包含 "expert_id": "{expert_id}" 字段
 2. 必须包含 "golden_few_shots" 数组字段，user_input 和 expert_reply 必须分离
 3. 必须包含 "supported_intents" 数组字段，至少 3 个意图且包含兜底意图
-4. 所有字符串值必须正确转义换行符和双引号
-5. 严禁在 JSON 中包含注释或额外文字说明
-6. 必须是有效的 JSON 格式，可直接被 json.loads() 解析"""
+4. 必须包含 "reasoning_logic" 数组字段，至少 3 步推理步骤
+5. 所有字符串值必须正确转义换行符和双引号
+6. 严禁在 JSON 中包含注释或额外文字说明
+7. 必须是有效的 JSON 格式，可直接被 json.loads() 解析"""
+
         return system_prompt
     
     def _clean_and_parse_json(self, text: str) -> dict | list:
@@ -1288,18 +1296,25 @@ def run_map_reduce_etl(
         print(f"[+] DigitalTwinProfile 已保存至: {identity_path}")
         
         # [核心节点]：使用 ExpertManager 保存专家数据
+        # [核心节点]：使用与全局 enterprise_knowledge_base.json 完全相同的 final_corpus 对象
+        # 严禁中间发生二次处理，确保数量 100% 对齐
         print(f"\n{'='*80}")
         print(f"步骤 4.5: 专家数据结构化存储")
         print(f"{'='*80}")
-        save_success = expert_manager.save_expert(
-            expert_id=expert_id,
-            profile=digital_twin,
-            knowledge_base=final_corpus
-        )
-        if save_success:
-            print(f"[+] 专家 {expert_id} 数据已结构化保存至 data/experts/")
-        else:
-            print(f"[!] 专家 {expert_id} 数据保存失败")
+        try:
+            save_success = expert_manager.save_expert(
+                expert_id=expert_id,
+                profile=digital_twin,
+                knowledge_base=final_corpus  # [核心节点]：共享同一对象，零拷贝
+            )
+            if save_success:
+                print(f"[+] 专家 {expert_id} 数据已结构化保存至 data/experts/")
+            else:
+                print(f"[!] 专家 {expert_id} 数据保存失败")
+        except Exception as e:
+            print(f"[!] 专家数据保存异常（非致命）: {type(e).__name__}: {e}")
+            print(f"[!] 全局知识库已保存，隔离知识库写入失败，请手动检查")
+
     else:
         print(f"\n[!] 跳过数字孪生侧写步骤")
         digital_twin = None
@@ -1344,123 +1359,20 @@ def run_map_reduce_etl(
     return final_corpus, digital_twin
 
 
-def run_full_pipeline(
-    source_file: str = "data/raw/source_data.csv",
-    use_universal_ingestor: bool = True,
-    output_dir: str = "data"
-):
-    """
-    [核心节点]：一键炼丹流水线 - 全自动数据接入与专家克隆
-    
-    输入：原始数据文件路径（CSV/JSONL/XLSX）
-    输出：专家数字孪生系统（画像 + 知识库 + 向量记忆）
-    
-    自动化流程：
-    1. 通用接入智能体嗅探结构 → 归一化清洗
-    2. Map-Reduce ETL 提取知识切片 + 侧写专家画像
-    3. ExpertManager 结构化存储
-    4. HybridSearchEngine 混合检索引擎入库
-    
-    [核心联动]：此函数是系统的唯一炼丹指令入口
-    """
+if __name__ == "__main__":
+    # [物理旁路 V2.0]：一键点火炼丹
+    # 彻底简化 DX：拒绝反人类的一行命令，直接执行 python services/etl_pipeline.py
     print("=" * 80)
-    print("🔥 一键炼丹流水线 - 全自动专家克隆系统")
+    print("🔥 正在启动本地黄金语料蒸馏流程 (ETL)...")
     print("=" * 80)
     
-    final_input_file = None
-    
-    # [核心节点]：优先从 .env 读取 LATEST_STAGING_FILE
-    latest_staging_file = os.getenv("LATEST_STAGING_FILE")
-    if latest_staging_file and Path(latest_staging_file).exists():
-        print(f"[阶段 1/4] 使用最新暂存文件")
-        print(f"[输入] {latest_staging_file}")
-        final_input_file = latest_staging_file
-    else:
-        print(f"[!] 未找到 LATEST_STAGING_FILE 或文件不存在")
-        print(f"[提示] 请先运行数据接入流程：python -c 'from tools.universal_ingestor import main; main()'" )
-        
-        # 步骤 1: 通用接入智能体 - 自动嗅探与归一化（降级方案）
-        if use_universal_ingestor:
-            source_path = Path(source_file)
-            if source_path.exists():
-                print(f"[阶段 1/4] 通用接入智能体 - 自动嗅探数据结构")
-                print(f"[输入] {source_file}")
-                print("-" * 80)
-                
-                try:
-                    ingest_agent = UniversalIngestionAgent()
-                    result = ingest_agent.ingest(str(source_path))
-                    
-                    if result["success"]:
-                        final_input_file = result.get("staging_file", "data/standard_ingestion.jsonl")
-                        print(f"[✓] 数据接入完成: {result['processed_count']} 对对话")
-                        print(f"[✓] 角色映射: {result['client_name']} → {result['expert_name']}")
-                    else:
-                        print(f"[!] 数据接入失败: {result.get('error', '未知错误')}")
-                        print(f"[!] 降级使用标准文件: data/standard_ingestion.jsonl")
-                        final_input_file = "data/standard_ingestion.jsonl"
-                except Exception as e:
-                    error_type = type(e).__name__
-                    log_error(error_type, str(e), f"UniversalIngestionAgent.ingest({source_file})")
-                    print(f"[!] 通用接入智能体异常: {error_type}: {e}")
-                    print(f"[!] 降级使用标准文件: data/standard_ingestion.jsonl")
-                    final_input_file = "data/standard_ingestion.jsonl"
-            else:
-                print(f"[!] 源数据文件不存在: {source_file}")
-                print(f"[!] 降级使用标准文件: data/standard_ingestion.jsonl")
-                final_input_file = "data/standard_ingestion.jsonl"
-        else:
-            # 不使用通用接入智能体，直接使用标准文件
-            final_input_file = "data/standard_ingestion.jsonl"
-    
-    # 检查最终输入文件是否存在
-    if not final_input_file or not Path(final_input_file).exists():
-        print(f"[!] 输入文件不存在: {final_input_file}")
-        print(f"[提示] 请先运行数据接入流程生成暂存文件")
-        return None, None
-    
-    # 步骤 2: Map-Reduce ETL 流程
-    print("\n[阶段 2/4] Map-Reduce ETL - 知识提取与画像侧写")
-    print("-" * 80)
-    
-    # [核心节点]：设置环境变量，实现架构回归
+    # 强制设置环境变量，确保可以重炼
     os.environ["FORCE_ETL_REBUILD"] = "1"
     
-    # 执行 ETL 流程
-    final_corpus, digital_twin = run_map_reduce_etl(
-        input_file=final_input_file,
-        output_dir=output_dir,
+    run_map_reduce_etl(
+        input_file="data/staging/demo_staging.jsonl",
+        output_dir="data",
         force_rebuild=True,
         skip_identity=False
     )
-    
-    # 步骤 3 & 4: 专家入库与向量化（已在 run_map_reduce_etl 中完成）
-    # [核心节点]：ETL 流程已自动调用 save_expert 和 upsert_full_corpus
-    
-    print("\n" + "=" * 80)
-    print("🎉 一键炼丹完成！专家系统已就绪")
-    print("=" * 80)
-    
-    if digital_twin:
-        print(f"\n[专家档案]")
-        print(f"  专家 ID: {digital_twin.expert_id}")
-        print(f"  专家名称: {digital_twin.expert_name}")
-        print(f"  专业领域: {digital_twin.domain_expertise}")
-        print(f"  知识切片: {len(final_corpus)} 条")
-        print(f"\n[启动指令]")
-        print(f"  streamlit run web_ui.py")
-        print(f"  # 然后在侧边栏'专家档案室'选择专家: {digital_twin.expert_id}")
-    
-    print("=" * 80)
-    
-    return final_corpus, digital_twin
 
-
-if __name__ == "__main__":
-    # [核心节点]：一键炼丹流水线 - 全自动数据接入与专家克隆
-    # 默认自动调用 UniversalIngestionAgent 处理 source_data.csv
-    run_full_pipeline(
-        source_file="source_data.csv",
-        use_universal_ingestor=True,
-        output_dir="data"
-    )

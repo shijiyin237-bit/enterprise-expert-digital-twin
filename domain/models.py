@@ -64,6 +64,11 @@ class DigitalTwinProfile(BaseModel):
         description="业务红线（禁止触碰的边界）",
         examples=["绝不承诺未发布的特性", "不得泄露客户敏感数据", "禁止提供未经授权的技术访问"]
     )
+    reasoning_logic: List[str] = Field(
+        default_factory=list,
+        description="专家专属的业务推理框架/SOP思考步骤，用于大模型 CoT 思维链注入，杜绝回复逻辑断层",
+        examples=[["第一步：确认客户痛点与情绪共情", "第二步：排查是否存在合规风险或业务红线", "第三步：给出带有明确行动点的解决方案"]]
+    )
     golden_few_shots: List[Dict[str, str]] = Field(
         default_factory=list,
         description="金牌示例对话，用于大模型 Few-Shot 模仿",
@@ -137,7 +142,7 @@ class DigitalTwinProfile(BaseModel):
         
         return cleaned
     
-    @field_validator('business_redlines')
+    @field_validator('business_redlines', 'reasoning_logic')
     @classmethod
     def clean_list_items(cls, v: List[str]) -> List[str]:
         """

@@ -336,12 +336,25 @@ with st.sidebar:
         # 检测专家切换
         new_expert_id = expert_options[selected_expert]
         if new_expert_id != st.session_state.current_expert_id:
-            # [核心节点]：切换专家时清空对话历史
-            st.session_state.current_expert_id = new_expert_id
-            st.session_state.messages = []
-            st.session_state.latest_trace = {}
-            st.success(f"已切换至专家: {selected_expert}")
+            try:
+                # [核心修复]：向 FastAPI 网关同步下发专家切换指令，打通多租户闭环
+                response = requests.post(
+                    "http://localhost:8088/api/v1/switch_expert",
+                    json={"expert_id": new_expert_id},
+                    timeout=10
+                )
+                if response.status_code == 200 and response.json().get("success"):
+                    # 网关切换成功后，才更新本地 UI 状态
+                    st.session_state.current_expert_id = new_expert_id
+                    st.session_state.messages = []
+                    st.session_state.latest_trace = {}
+                    st.success(f"已成功加载专家: {selected_expert}")
+                else:
+                    st.error(f"网关切换专家失败: {response.text}")
+            except Exception as e:
+                st.error(f"无法连接到网关，多租户同步失败: {e}")
             st.rerun()
+
         
         # 显示当前专家信息
         current_expert = next(
