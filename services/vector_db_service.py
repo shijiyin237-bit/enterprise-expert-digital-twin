@@ -8,7 +8,8 @@ import json
 import os
 import time
 import pickle
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
 from dotenv import load_dotenv
 import openai
 import chromadb
@@ -89,7 +90,11 @@ class HybridSearchEngine:
         self.rerank_url = "https://api.siliconflow.cn/v1/rerank"
         self.rerank_model = "BAAI/bge-reranker-v2-m3"
         
+        # [核心节点]：BM25 索引内存缓存，防止高并发下频繁 pickle.load 锁死磁盘
+        self._bm25_cache: Dict[str, dict] = {}
+        
         print(f"[+] HybridSearchEngine 初始化完成")
+
         print(f"    - 向量数据库路径: {self.chroma_dir}")
         print(f"    - 集合名称: {self.collection_name}")
         print(f"    - Embedding 模型: {self.embedding_model}")
@@ -121,23 +126,33 @@ class HybridSearchEngine:
             print(f"[!] Embedding 调用失败，触发自动重试: {e}")
             raise
     
-    def _get_expert_collection(self, expert_id: str):
+    def _get_collection(self, collection_name: str):
         """
-        [核心节点]：根据专家 ID 动态获取/创建物理隔离的向量集合
+        [核心节点]：根据动态路由获取/创建物理隔离的向量集合
         ChromaDB 集合命名规范：3-63 字符，只允许字母、数字、下划线和连字符
+        
+        输入：集合名称（如 expert_jinpaifuwu_001_soul、tenant_default_kb）
+        输出：ChromaDB Collection 对象
         """
         import re
-        clean_id = re.sub(r'[^a-zA-Z0-9_-]', '_', expert_id)
-        collection_name = f"expert_{clean_id}_memory"
-        if len(collection_name) > 63:
-            collection_name = collection_name[:63]
+        clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', collection_name)
+        if len(clean_name) > 63:
+            clean_name = clean_name[:63]
         
         return self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"description": f"专家 {expert_id} 的物理隔离向量知识库"}
+            name=clean_name,
+            metadata={"description": f"命名空间 {collection_name} 的物理隔离向量知识库"}
         )
     
-    def upsert_full_corpus(self, expert_id: str, knowledge_base: List[KnowledgeChunk] = None):
+    def _get_expert_collection(self, expert_id: str):
+        """
+        [核心节点]：根据专家 ID 动态获取/创建物理隔离的向量集合（A 库默认路由）
+        降级路由为 expert_{expert_id}_soul（专家专属对话 A 库）
+        """
+        return self._get_collection(f"expert_{expert_id}_soul")
+
+    
+    def upsert_full_corpus(self, expert_id: str, knowledge_base: List[KnowledgeChunk] = None, collection_name: str = None):
 
         """
         [核心节点]：企业级知识切片向量化入库（多租户版本）
@@ -145,6 +160,8 @@ class HybridSearchEngine:
         输入：
             - expert_id: 专家唯一标识（租户隔离键）
             - knowledge_base: 企业级知识切片列表（由 ETL 环节清洗完毕的标准 JSON 结构）
+            - collection_name: 目标集合名称（选参）。若传入，调用 _get_collection(collection_name)；
+                               若无，默认降级路由为 expert_{expert_id}_soul（专家专属对话 A 库）
         输出：无
         副作用：向本地 ChromaDB 向量数据库批量插入数据
         
@@ -170,14 +187,20 @@ class HybridSearchEngine:
             print(f"[!] 知识库为空，跳过入库")
             return
         
-        # [核心节点]：动态获取专家专属集合（集合级物理隔离）
-        collection = self._get_expert_collection(expert_id)
+        # [核心节点]：动态路由 - 若传入 collection_name 则使用通用集合，否则降级为 expert 默认集合
+        if collection_name:
+            collection = self._get_collection(collection_name)
+            target_label = collection_name
+        else:
+            collection = self._get_expert_collection(expert_id)
+            target_label = f"expert_{expert_id}_soul"
         
         print(f"\n{'='*80}")
         print(f"[核心节点]：开始企业级知识切片向量化入库")
         print(f"{'='*80}")
         print(f"[+] 知识切片总数: {len(knowledge_base)}")
-        print(f"[+] 目标集合: expert_{expert_id}_memory (物理隔离)")
+        print(f"[+] 目标集合: {target_label} (物理隔离)")
+
         
         # [核心节点]：批量入库
 
@@ -273,11 +296,16 @@ class HybridSearchEngine:
             
             print(f"    ✓ BM25 索引构建完成，已物理保存至: {bm25_index_path}")
             print(f"    ✓ 索引包含 {len(tokenized_corpus)} 条分词文档")
+            
+            # [核心节点]：双轨写入成功，同步更新/覆写内存缓存
+            self._bm25_cache[expert_id] = bm25_data
+            print(f"    ✓ BM25 内存缓存已同步更新 (expert_id={expert_id})")
         except Exception as e:
             print(f"[!] BM25 索引构建失败（非致命）: {e}")
             print(f"[!] 向量检索仍可正常工作，仅关键词检索不可用")
         
         print(f"\n[+] 企业级知识切片入库完成！")
+
         print(f"    - 总切片数: {total_chunks}")
         print(f"    - 向量数据库: {self.chroma_dir}")
         print(f"    - BM25索引: data/experts/{expert_id}/bm25_index.pkl")
@@ -342,7 +370,7 @@ class HybridSearchEngine:
             # [核心节点]：降级机制 - 网络错误时返回原顺序的 documents
             return [{"index": i, "text": doc, "score": 0.0} for i, doc in enumerate(documents[:top_n])]
     
-    def hybrid_search(self, query: str, expert_id: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    def hybrid_search(self, query: str, expert_id: str, top_k: int = 3, collection_name: str = None) -> List[KnowledgeChunk]:
         """
         [核心节点]：企业级混合检索（Dense + Sparse + Reranking）
         
@@ -350,7 +378,9 @@ class HybridSearchEngine:
             - query: 自然语言查询文本
             - expert_id: 专家唯一标识（租户隔离过滤键）
             - top_k: 返回数量（B 端默认 3 条）
-        输出：经过三路混合检索和重排后的最相关知识切片列表
+            - collection_name: 目标集合名称（选参）。若传入，并行检索 B 库事实和 A 库人设；
+                               若无，默认降级路由为 expert_{expert_id}_soul（A 库）
+        输出：经过 Pydantic 强校验的 List[KnowledgeChunk] 列表
         副作用：调用向量数据库、BM25 索引和重排模型
         
         原理：
@@ -358,17 +388,23 @@ class HybridSearchEngine:
             2. [第二路] Sparse Retrieval：从 BM25 关键词索引召回 Top-20
             3. [去重合流]：将两路召回结果合并去重
             4. [交叉重排]：使用 BGE-Reranker 对候选集精细排序
-            5. 返回最终 Top-k 结果
+            5. [强契约收拢]：通过 KnowledgeChunk 反序列化构造，确保数据契约完整性
+            6. 返回最终 Top-k 结果
         
         [核心节点]：任何一路报错都平滑降级到纯向量检索，确保系统可用性
         """
         print(f"\n[核心节点]：启动混合检索流程: {query}")
         print(f"    - 专家 ID: {expert_id}")
         print(f"    - 目标返回数: {top_k}")
+        print(f"    - 集合名称: {collection_name or f'expert_{expert_id}_soul (默认)'}")
         
         # [第一路]：Dense Retrieval（向量召回）
-        # [核心节点]：动态获取专家专属集合（集合级物理隔离）
-        collection = self._get_expert_collection(expert_id)
+        # [核心节点]：动态路由 - 若传入 collection_name 则使用通用集合，否则降级为 expert 默认集合
+        if collection_name:
+            collection = self._get_collection(collection_name)
+        else:
+            collection = self._get_expert_collection(expert_id)
+
         vector_candidates = []
         try:
             print(f"[+] 第一路检索：Dense Retrieval (ChromaDB)")
@@ -398,15 +434,28 @@ class HybridSearchEngine:
         bm25_candidates = []
         try:
             print(f"[+] 第二路检索：Sparse Retrieval (BM25)")
-            bm25_index_path = os.path.join(self.base_dir, "data", "experts", expert_id, "bm25_index.pkl")
             
-            if os.path.exists(bm25_index_path):
-                with open(bm25_index_path, 'rb') as f:
-                    bm25_data = pickle.load(f)
-                
+            # [核心节点]：BM25 内存缓存读取，防止高并发下频繁 pickle.load 锁死磁盘
+            if expert_id in self._bm25_cache:
+                print(f"    ✓ 命中 BM25 内存缓存 (expert_id={expert_id})")
+                bm25_data = self._bm25_cache[expert_id]
+            else:
+                bm25_index_path = os.path.join(self.base_dir, "data", "experts", expert_id, "bm25_index.pkl")
+                if not os.path.exists(bm25_index_path):
+                    print(f"[!] BM25 索引文件不存在: {bm25_index_path}")
+                    bm25_data = None
+                else:
+                    print(f"    ✓ 从磁盘加载 BM25 索引并写入内存缓存")
+                    with open(bm25_index_path, 'rb') as f:
+                        bm25_data = pickle.load(f)
+                    # [核心节点]：写入内存缓存，下次直接命中
+                    self._bm25_cache[expert_id] = bm25_data
+            
+            if bm25_data:
                 bm25 = bm25_data["bm25"]
                 corpus = bm25_data["corpus"]
                 metadata_list = bm25_data["metadata"]
+
                 
                 # [核心节点]：使用 jieba 对 query 分词
                 query_tokens = jieba.lcut(query)
@@ -469,8 +518,31 @@ class HybridSearchEngine:
             print(f"[!] 混合检索无结果，降级到纯向量检索")
             reranked_results = vector_candidates[:top_k]
         
-        print(f"[+] 混合检索完成，最终返回 {len(reranked_results)} 个结果")
-        return reranked_results
+        # [强契约收拢]：通过 KnowledgeChunk 反序列化构造，确保数据契约完整性
+        final_results: List[KnowledgeChunk] = []
+        for item in reranked_results:
+            try:
+                metadata = item.get("metadata", {})
+                kc = KnowledgeChunk(
+                    expert_id=metadata.get("expert_id", expert_id),
+                    content=item.get("text", ""),
+                    chunk_type=metadata.get("chunk_type", "BUSINESS_RULE"),
+                    citation_source=metadata.get("citation_source", "hybrid_search")
+                )
+                # [核心节点]：将 rerank_score 等遥测数据附加到 KnowledgeChunk 的 metadata 中
+                # 由于 KnowledgeChunk 是 Pydantic 模型，使用 __dict__ 扩展
+                kc_dict = kc.model_dump()
+                kc_dict["rerank_score"] = item.get("rerank_score", 0.0)
+                kc_dict["source"] = item.get("source", "unknown")
+                kc_dict["retrieval_source"] = item.get("source", "unknown")
+                final_results.append(kc)
+            except Exception as e:
+                print(f"[!] 知识切片反序列化失败，跳过: {e}")
+                continue
+        
+        print(f"[+] 混合检索完成，最终返回 {len(final_results)} 个结果（Pydantic 强校验）")
+        return final_results
+
 
 
 if __name__ == "__main__":

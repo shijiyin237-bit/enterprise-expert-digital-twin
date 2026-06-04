@@ -10,16 +10,21 @@ ETL 语料蒸馏与格式化微服务 - Map-Reduce 架构
 import json
 import os
 import sys
-from pathlib import Path
-from typing import List, Dict, Any
-import openai
-from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import re
 import difflib
+import pickle
+import hashlib
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from collections import Counter
 from datetime import datetime
+import openai
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+
 
 # [核心节点]：工业级容错库，指数退避重试机制
 try:
@@ -73,8 +78,270 @@ if not CLIENT_NAME or not EXPERT_NAME:
     raise ValueError("[致命错误] 环境变量 CLIENT_NAME 和 EXPERT_NAME 必须在 .env 中配置")
 
 
+# ============================================================
+# [Ingest Hub 2.0] 多模态文档解析契约与抽象基类
+# ============================================================
+
+@dataclass
+class ParsedDocument:
+    """
+    [数据契约] 多模态解析后的统一文档表示
+    
+    所有解析器（CSV、Docling等）必须输出此格式，
+    确保下游 ETL 流水线无需关心原始文件格式。
+    """
+    content: str = ""                          # 文档纯文本内容
+    metadata: Dict[str, Any] = field(default_factory=dict)  # 元数据（标题、层级、来源等）
+    chunks: List[KnowledgeChunk] = field(default_factory=list)  # 预切分的知识切片（B库直接使用）
+    source_file: str = ""                      # 原始文件路径
+    file_hash: str = ""                        # MD5 文件指纹（去重用）
+
+
+class BaseDocumentParser(ABC):
+    """
+    [抽象基类] 文档解析器接口
+    
+    所有具体解析器必须实现 parse() 方法，
+    返回统一的 ParsedDocument 对象。
+    """
+    
+    @abstractmethod
+    def parse(self, file_path: str) -> ParsedDocument:
+        """
+        解析文档并返回统一契约
+        
+        输入：文件路径
+        输出：ParsedDocument 对象
+        副作用：无
+        """
+        pass
+    
+    @staticmethod
+    def compute_file_hash(file_path: str) -> str:
+        """
+        计算文件 MD5 指纹，用于去重
+        
+        输入：文件路径
+        输出：MD5 十六进制字符串
+        """
+        hasher = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+
+class CSVLegacyParser(BaseDocumentParser):
+    """
+    [A库解析器] 传统 CSV/JSONL 聊天对话解析器
+    
+    继承并重构原 SemanticChunker 的 load_and_chunk 逻辑。
+    自动读取 .csv 或 .jsonl 的聊天对话，格式化为 ParsedDocument。
+    """
+    
+    def __init__(self, qa_pairs_per_chunk: int = 10):
+        self.qa_pairs_per_chunk = qa_pairs_per_chunk
+        self.lines_per_chunk = qa_pairs_per_chunk * 2  # 每对问答 = 2行
+    
+    def parse(self, file_path: str) -> ParsedDocument:
+        """
+        解析 CSV/JSONL 聊天对话文件
+        
+        输入：文件路径（.csv 或 .jsonl）
+        输出：ParsedDocument 对象
+        副作用：无
+        """
+        print(f"[CSVLegacyParser] 正在解析文件: {file_path}")
+        
+        file_hash = self.compute_file_hash(file_path)
+        corpus_data = []
+        
+        # 读取 JSONL 文件
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            corpus_data.append(json.loads(line))
+                        except json.JSONDecodeError as e:
+                            print(f"[警告] 跳过无效JSON行: {e}")
+                            continue
+        except Exception as e:
+            print(f"[致命拦截] 文件读取失败: {e}")
+            raise
+        
+        print(f"[CSVLegacyParser] 成功读取 {len(corpus_data)} 行原始数据")
+        
+        # Token 熔断
+        MAX_CORPUS_SIZE = 500
+        if len(corpus_data) > MAX_CORPUS_SIZE:
+            print(f"[!] Token 熔断触发：数据集大小 {len(corpus_data)} 超过阈值 {MAX_CORPUS_SIZE}，已强制截断")
+            corpus_data = corpus_data[:MAX_CORPUS_SIZE]
+        
+        # 按完整问答对切分
+        chunks = []
+        for i in range(0, len(corpus_data), self.lines_per_chunk):
+            chunk = corpus_data[i:i + self.lines_per_chunk]
+            chunks.append(chunk)
+        
+        # 构建完整文本内容
+        full_text = ""
+        for item in corpus_data:
+            speaker = item.get('speaker', '未知')
+            content = item.get('content', '')
+            full_text += f"[{speaker}]: {content}\n"
+        
+        print(f"[CSVLegacyParser] 解析完成，共 {len(chunks)} 个 Chunk")
+        
+        return ParsedDocument(
+            content=full_text,
+            metadata={
+                "parser": "CSVLegacyParser",
+                "total_lines": len(corpus_data),
+                "total_chunks": len(chunks),
+                "qa_pairs_per_chunk": self.qa_pairs_per_chunk
+            },
+            source_file=file_path,
+            file_hash=file_hash
+        )
+
+
+class DoclingMultiModalParser(BaseDocumentParser):
+    """
+    [B库解析器] 多模态文档解析器（PDF/Word/Excel/PPTX）
+    
+    使用 Docling 2026 进行版面分析，将非结构化文档碾碎为 Markdown AST。
+    导入防爆机制：docling 仅在 _lazy_init() 中懒加载。
+    物理沙箱运行：通过 ProcessPoolExecutor 隔离子进程。
+    """
+    
+    def __init__(self):
+        self._converter = None  # 懒加载
+    
+    def _lazy_init(self):
+        """
+        [导入防爆机制] 懒加载 Docling
+        
+        仅在首次解析时 import docling，保护轻量级启动内存。
+        防止系统网关启动时发生 Torch 内存坍塌。
+        """
+        if self._converter is None:
+            print("[DoclingMultiModalParser] 懒加载 Docling 库...")
+            try:
+                from docling.document_converter import DocumentConverter
+                from docling.chunking import HierarchicalChunker
+                self._converter = DocumentConverter()
+                self._chunker = HierarchicalChunker()
+                print("[DoclingMultiModalParser] Docling 库加载成功")
+            except ImportError as e:
+                print(f"[!] Docling 库导入失败: {e}")
+                print("[!] 请安装: pip install docling")
+                raise
+    
+    def parse(self, file_path: str) -> ParsedDocument:
+        """
+        [物理沙箱运行] 解析多模态文档
+        
+        输入：文件路径（.pdf / .docx / .xlsx / .pptx）
+        输出：ParsedDocument 对象
+        副作用：在子进程中运行 Docling，主进程不阻塞
+        
+        沙箱策略：
+            1. ProcessPoolExecutor(max_workers=1) 隔离子进程
+            2. future.result(timeout=120) 超时防护
+            3. 超时自动 cancel 任务并打印中文日志
+        """
+        print(f"[DoclingMultiModalParser] 正在解析文件: {file_path}")
+        
+        file_hash = self.compute_file_hash(file_path)
+        file_ext = Path(file_path).suffix.lower()
+        
+        # 在子进程中执行 Docling 转换
+        with ProcessPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._run_docling_convert, file_path)
+            
+            try:
+                # [超时防护] 120 秒超时
+                result = future.result(timeout=120)
+                docling_doc, content_text, knowledge_chunks = result
+                
+                print(f"[DoclingMultiModalParser] 解析完成，提取 {len(knowledge_chunks)} 个知识切片")
+                
+                return ParsedDocument(
+                    content=content_text,
+                    metadata={
+                        "parser": "DoclingMultiModalParser",
+                        "file_type": file_ext,
+                        "num_chunks": len(knowledge_chunks),
+                        "docling_output": str(docling_doc) if docling_doc else ""
+                    },
+                    chunks=knowledge_chunks,
+                    source_file=file_path,
+                    file_hash=file_hash
+                )
+                
+            except TimeoutError:
+                print(f"❌ [致命拦截] Docling 解析超时（120秒），已物理终止子进程...")
+                future.cancel()
+                raise TimeoutError(f"Docling 解析超时: {file_path}")
+            except Exception as e:
+                print(f"❌ [致命拦截] Docling 解析失败: {e}")
+                raise
+    
+    def _run_docling_convert(self, file_path: str):
+        """
+        在子进程中执行 Docling 转换
+        
+        输入：文件路径
+        输出：(docling_doc, content_text, knowledge_chunks) 元组
+        """
+        # [导入防爆] 在子进程内懒加载
+        self._lazy_init()
+        
+        # 转换文档
+        print(f"[DoclingMultiModalParser] 正在转换文档: {file_path}")
+        result = self._converter.convert(file_path)
+        docling_doc = result.document
+        
+        # 使用 HierarchicalChunker 进行布局感知切片
+        print(f"[DoclingMultiModalParser] 正在执行层级感知切片...")
+        chunk_iter = self._chunker.chunk(docling_doc)
+        
+        content_text = ""
+        knowledge_chunks = []
+        
+        for i, chunk in enumerate(chunk_iter):
+            # 提取文本内容
+            chunk_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
+            content_text += chunk_text + "\n\n"
+            
+            # 提取层级元数据
+            meta = chunk.meta if hasattr(chunk, 'meta') else {}
+            headings = meta.get('headings', []) if isinstance(meta, dict) else []
+            
+            # 将标题级联元数据缝合进 citation_source
+            heading_path = " > ".join(headings) if headings else "无标题"
+            citation_source = f"{Path(file_path).stem} | {heading_path}"
+            
+            # 构建 KnowledgeChunk
+            try:
+                kc = KnowledgeChunk(
+                    expert_id="",  # 由调用方注入
+                    content=chunk_text,
+                    chunk_type="BUSINESS_RULE",  # B 库默认类型
+                    citation_source=citation_source
+                )
+                knowledge_chunks.append(kc)
+            except Exception as e:
+                print(f"[!] 跳过切片 {i}: {e}")
+                continue
+        
+        return docling_doc, content_text, knowledge_chunks
+
+
 class SemanticChunker:
     """语义边界切片器 - 基于完整问答对切分语料，确保上下文完整性"""
+
     
     def __init__(self, qa_pairs_per_chunk: int = 10):
         """
@@ -1141,222 +1408,329 @@ class DigitalTwinDistiller:
 
 
 def run_map_reduce_etl(
-    input_file: str = "date_0120_fixed.jsonl",
+    input_file: str = "data/staging/demo_staging.jsonl",
     output_dir: str = "data",
     skip_llm: bool = False,
     max_workers: int = 3,
     test_single_chunk: bool = False,
     skip_identity: bool = False,
     skip_reduce: bool = False,
-    force_rebuild: bool = False
+    force_rebuild: bool = False,
+    tenant_id: str = None
 ):
     """
-    运行 Map-Reduce ETL 流程
+    [A/B 双轨分级分发] 运行 Map-Reduce ETL 流程
     
-    Args:
-        input_file: 输入 JSONL 文件名
-        output_dir: 输出目录
-        skip_llm: 是否跳过 LLM 调用
-        max_workers: 并发线程数
-        force_rebuild: 是否强制重炼（需要指挥官授权）
+    输入：
+        - input_file: 输入文件路径（自动根据后缀判定 A/B 轨）
+        - output_dir: 输出目录
+        - skip_llm: 是否跳过 LLM 调用
+        - max_workers: 并发线程数
+        - test_single_chunk: 测试模式
+        - skip_identity: 跳过画像侧写
+        - skip_reduce: 跳过 Reduce 阶段
+        - force_rebuild: 是否强制重炼
+        - tenant_id: 租户 ID（B 库专用，用于 tenant_{tenant_id}_kb 集合）
+    
+    输出：
+        - A 库（CSV/JSONL）：(final_corpus, digital_twin) 元组
+        - B 库（PDF/DOCX/XLSX）：(knowledge_chunks, None) 元组
+    
+    原理：
+        - 读取输入文件后缀，自动判定数据流
+        - .csv / .jsonl → 专家灵魂 A 库 → CSVLegacyParser → LLMMapNode → LLMJudgeReduce → DigitalTwinDistiller → expert_{id}_soul
+        - .pdf / .docx / .xlsx → 企业事实 B 库 → DoclingMultiModalParser → 跳过对话提纯 → 直接落盘 → tenant_{tenant_id}_kb
     """
     # [核心节点]：ETL 算力锁
     if not force_rebuild and not os.getenv("FORCE_ETL_REBUILD"):
         print("[拦截] 全量语料清洗需消耗大量算力，当前处于锁定状态。如需重炼，请联系指挥官授权。")
-        return
+        return None, None
     
     print("=" * 80)
-    print("Map-Reduce ETL 语料蒸馏引擎 - 启动")
+    print("🔥 Map-Reduce ETL 语料蒸馏引擎 - 启动")
     print("=" * 80)
     
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     print(f"[+] 输出目录已准备: {os.path.abspath(output_dir)}")
     
-    # 步骤 1: 智能切块
-    print(f"\n{'='*80}")
-    print(f"步骤 1: 智能切块 - 语义边界切片器")
-    print(f"{'='*80}")
-    chunker = SemanticChunker(qa_pairs_per_chunk=10)
-    chunks = chunker.load_and_chunk(input_file)
+    # [A/B 双轨判定]：根据文件后缀自动分发
+    file_ext = Path(input_file).suffix.lower()
+    print(f"[A/B 双轨判定] 输入文件: {input_file}")
+    print(f"[A/B 双轨判定] 文件后缀: {file_ext}")
     
-    if skip_llm:
-        print(f"\n[!] 跳过 LLM 调用，仅完成切块")
-        return
-    
-    # [核心节点]：在 Map 阶段前生成 expert_id（前置注入点）
-    expert_manager = get_expert_manager()
-    temp_expert_name = EXPERT_NAME or "未命名专家"
-    current_expert_id = expert_manager.generate_expert_id(temp_expert_name)
-    print(f"[+] 生成专家唯一标识（前置）: {current_expert_id}")
-    print(f"[+] 此 ID 将注入到所有知识切片和专家画像")
-    
-    # 步骤 2: 并发 Map 阶段
-    print(f"\n{'='*80}")
-    print(f"步骤 2: 企业级知识提取 - Map Phase (并发处理)")
-    print(f"{'='*80}")
-    
-    map_node = LLMMapNode()
-    all_chunks = []
-    
-    start_time = time.time()
-    
-    # 测试模式：只处理第一个 Chunk
-    if test_single_chunk:
-        print(f"[测试模式] 仅处理第一个 Chunk 进行调试")
-        chunks = chunks[:1]
-        max_workers = 1
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务（注入 expert_id 到每个 chunk 处理）
-        future_to_chunk = {
-            executor.submit(map_node.extract_chunk, chunk, i, current_expert_id): i
-            for i, chunk in enumerate(chunks)
-        }
+    if file_ext in ('.csv', '.jsonl'):
+        # ============================================================
+        # [A 轨] 专家灵魂 A 库：聊天对话 → 画像侧写流水线
+        # ============================================================
+        print(f"\n{'='*80}")
+        print(f"[A 轨] 专家灵魂 A 库 - 聊天对话蒸馏流水线")
+        print(f"{'='*80}")
         
-        # 收集结果
-        for future in as_completed(future_to_chunk):
-            chunk_index = future_to_chunk[future]
+        # 步骤 1: 使用 CSVLegacyParser 解析
+        print(f"\n步骤 1: 多模态解析 - CSVLegacyParser")
+        print(f"{'='*80}")
+        csv_parser = CSVLegacyParser(qa_pairs_per_chunk=10)
+        parsed_doc = csv_parser.parse(input_file)
+        print(f"[A 轨] 解析完成，共 {parsed_doc.metadata.get('total_chunks', 0)} 个 Chunk")
+        
+        # 将 ParsedDocument 转换为 SemanticChunker 兼容的 chunks 格式
+        # 重新读取原始文件构建 chunks（保持向后兼容）
+        chunker = SemanticChunker(qa_pairs_per_chunk=10)
+        chunks = chunker.load_and_chunk(input_file)
+        
+        if skip_llm:
+            print(f"\n[!] 跳过 LLM 调用，仅完成解析")
+            return None, None
+        
+        # [核心节点]：在 Map 阶段前生成 expert_id（前置注入点）
+        expert_manager = get_expert_manager()
+        temp_expert_name = EXPERT_NAME or "未命名专家"
+        current_expert_id = expert_manager.generate_expert_id(temp_expert_name)
+        print(f"[+] 生成专家唯一标识（前置）: {current_expert_id}")
+        print(f"[+] 此 ID 将注入到所有知识切片和专家画像")
+        
+        # 步骤 2: 并发 Map 阶段
+        print(f"\n{'='*80}")
+        print(f"步骤 2: 企业级知识提取 - Map Phase (并发处理)")
+        print(f"{'='*80}")
+        
+        map_node = LLMMapNode()
+        all_chunks = []
+        
+        start_time = time.time()
+        
+        # 测试模式：只处理第一个 Chunk
+        if test_single_chunk:
+            print(f"[测试模式] 仅处理第一个 Chunk 进行调试")
+            chunks = chunks[:1]
+            max_workers = 1
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_chunk = {
+                executor.submit(map_node.extract_chunk, chunk, i, current_expert_id): i
+                for i, chunk in enumerate(chunks)
+            }
+            
+            for future in as_completed(future_to_chunk):
+                chunk_index = future_to_chunk[future]
+                try:
+                    knowledge_chunks = future.result()
+                    all_chunks.extend(knowledge_chunks)
+                except Exception as e:
+                    error_type = type(e).__name__
+                    error_msg = str(e)
+                    print(f"[!] 切片 {chunk_index + 1} 异常: {error_type}: {error_msg}")
+                    
+                    if "ConnectError" in error_type or "Connection" in error_msg:
+                        print(f"[!] 网络连接错误，请检查：")
+                        print(f"    1. BASE_URL 配置是否正确")
+                        print(f"    2. 网络是否需要代理设置")
+                        print(f"    3. 运行 python debug_api.py 进行诊断")
+        
+        elapsed_time = time.time() - start_time
+        print(f"\n[+] Map 阶段完成，耗时 {elapsed_time:.2f} 秒")
+        print(f"[+] 共提取 {len(all_chunks)} 条企业级知识切片")
+        
+        # [核心节点]：绝对的物理熔断锁 (The Kill Switch)
+        if not all_chunks:
+            print("\n[致命拦截] 知识提取阶段未能获取任何有效数据！")
+            print("动作：已物理切断后续 Reduce 和画像侧写流程，防止产生幻觉。")
+            return None, None
+        
+        # [核心节点]：双重保障 - 确保所有 chunks 都有 expert_id
+        injected_count = 0
+        for chunk in all_chunks:
+            if not hasattr(chunk, 'expert_id') or not chunk.expert_id:
+                chunk.expert_id = current_expert_id
+                injected_count += 1
+        if injected_count > 0:
+            print(f"[+] 为 {injected_count} 条知识切片注入 expert_id")
+        
+        # 步骤 3: Reduce 阶段
+        if not skip_reduce:
+            print(f"\n{'='*80}")
+            print(f"步骤 3: 首席知识官审查 - Reduce Phase")
+            print(f"{'='*80}")
+            
+            judge = LLMJudgeReduce()
+            final_corpus = judge.judge_and_reduce(all_chunks, current_expert_id)
+        else:
+            print(f"\n[!] 跳过 Reduce 阶段，直接使用 Map 阶段输出")
+            final_corpus = all_chunks
+        
+        # 保存结构化语料库
+        corpus_path = os.path.join(output_dir, "enterprise_knowledge_base.json")
+        with open(corpus_path, 'w', encoding='utf-8') as f:
+            json.dump([chunk.model_dump() for chunk in final_corpus], f, ensure_ascii=False, indent=2)
+        print(f"[+] 企业级知识库已保存至: {corpus_path}")
+        
+        expert_id = None
+        if not skip_identity:
+            print(f"\n{'='*80}")
+            print(f"步骤 4: 数字孪生侧写师 - 提取企业专家画像")
+            print(f"{'='*80}")
+            print(f"[+] 正在侧写专家: {EXPERT_NAME} | 客户: {CLIENT_NAME}")
+            distiller = DigitalTwinDistiller()
+            digital_twin = distiller.distill_digital_twin(final_corpus, current_expert_id)
+            
+            expert_id = digital_twin.expert_id or current_expert_id
+            digital_twin.expert_id = expert_id
+            print(f"[+] 专家唯一标识确认: {expert_id}")
+            
+            for chunk in final_corpus:
+                chunk.expert_id = expert_id
+            
+            identity_path = os.path.join(output_dir, "digital_twin_profile.json")
+            with open(identity_path, 'w', encoding='utf-8') as f:
+                json.dump(digital_twin.model_dump(), f, ensure_ascii=False, indent=2)
+            print(f"[+] DigitalTwinProfile 已保存至: {identity_path}")
+            
+            print(f"\n{'='*80}")
+            print(f"步骤 4.5: 专家数据结构化存储")
+            print(f"{'='*80}")
             try:
-                knowledge_chunks = future.result()
-                all_chunks.extend(knowledge_chunks)
+                save_success = expert_manager.save_expert(
+                    expert_id=expert_id,
+                    profile=digital_twin,
+                    knowledge_base=final_corpus
+                )
+                if save_success:
+                    print(f"[+] 专家 {expert_id} 数据已结构化保存至 data/experts/")
+                else:
+                    print(f"[!] 专家 {expert_id} 数据保存失败")
             except Exception as e:
-                error_type = type(e).__name__
-                error_msg = str(e)
-                print(f"[!] 切片 {chunk_index + 1} 异常: {error_type}: {error_msg}")
-                
-                # [核心节点]：网络错误特殊提示
-                if "ConnectError" in error_type or "Connection" in error_msg:
-                    print(f"[!] 网络连接错误，请检查：")
-                    print(f"    1. BASE_URL 配置是否正确")
-                    print(f"    2. 网络是否需要代理设置")
-                    print(f"    3. 运行 python debug_api.py 进行诊断")
-    
-    elapsed_time = time.time() - start_time
-    print(f"\n[+] Map 阶段完成，耗时 {elapsed_time:.2f} 秒")
-    print(f"[+] 共提取 {len(all_chunks)} 条企业级知识切片")
-    
-    # [核心节点]：绝对的物理熔断锁 (The Kill Switch)
-    if not all_chunks:
-        print("\n[致命拦截] 知识提取阶段未能获取任何有效数据！")
-        print("原因：数据源不匹配或大模型连续纠错失败。")
-        print("动作：已物理切断后续 Reduce 和画像侧写流程，防止产生幻觉。")
-        return None, None
-    
-    # [核心节点]：双重保障 - 确保所有 chunks 都有 expert_id
-    injected_count = 0
-    for chunk in all_chunks:
-        if not hasattr(chunk, 'expert_id') or not chunk.expert_id:
-            chunk.expert_id = current_expert_id
-            injected_count += 1
-    if injected_count > 0:
-        print(f"[+] 为 {injected_count} 条知识切片注入 expert_id")
-    
-    # 步骤 3: Reduce 阶段
-    if not skip_reduce:
+                print(f"[!] 专家数据保存异常（非致命）: {type(e).__name__}: {e}")
+        else:
+            print(f"\n[!] 跳过数字孪生侧写步骤")
+            digital_twin = None
+        
+        # 步骤 5: 向量化入库至 expert_{id}_soul 集合
+        if expert_id and final_corpus:
+            print(f"\n{'='*80}")
+            print(f"步骤 5: 知识向量化入库 - expert_{expert_id}_soul")
+            print(f"{'='*80}")
+            try:
+                vector_engine = HybridSearchEngine()
+                vector_engine.upsert_full_corpus(
+                    expert_id=expert_id,
+                    knowledge_base=final_corpus
+                )
+                print(f"[+] 专家 {expert_id} 知识库已自动向量化入库至 expert_{expert_id}_soul")
+            except Exception as e:
+                print(f"[!] 向量化入库失败: {e}")
+                print(f"[!] 请手动运行向量入库脚本修复")
+        
         print(f"\n{'='*80}")
-        print(f"步骤 3: 首席知识官审查 - Reduce Phase")
+        print(f"[A 轨] ETL 流程执行完成")
+        print(f"{'='*80}")
+        print(f"摘要:")
+        print(f"  - 处理 Chunk 数: {len(chunks)}")
+        print(f"  - Map 阶段提取: {len(all_chunks)} 条企业级知识")
+        print(f"  - Reduce 阶段精选: {len(final_corpus)} 条高纯度知识")
+        if digital_twin:
+            print(f"  - 提取专家画像: {digital_twin.expert_name} ({expert_id})")
+            print(f"  - 专家数据目录: data/experts/{expert_id}/")
+        print(f"  - 总耗时: {elapsed_time:.2f} 秒")
         print(f"{'='*80}")
         
-        judge = LLMJudgeReduce()
-        final_corpus = judge.judge_and_reduce(all_chunks, current_expert_id)
-    else:
-        print(f"\n[!] 跳过 Reduce 阶段，直接使用 Map 阶段输出")
-        final_corpus = all_chunks
-    
-    # 保存结构化语料库
-    corpus_path = os.path.join(output_dir, "enterprise_knowledge_base.json")
-    with open(corpus_path, 'w', encoding='utf-8') as f:
-        json.dump([chunk.model_dump() for chunk in final_corpus], f, ensure_ascii=False, indent=2)
-    print(f"[+] 企业级知识库已保存至: {corpus_path}")
-    
-    expert_id = None  # 用于后续向量化入库
-    if not skip_identity:
+        return final_corpus, digital_twin
+        
+    elif file_ext in ('.pdf', '.docx', '.xlsx', '.pptx'):
+        # ============================================================
+        # [B 轨] 企业事实 B 库：静态文档 → 直接落盘
+        # ============================================================
         print(f"\n{'='*80}")
-        print(f"步骤 4: 数字孪生侧写师 - 提取企业专家画像")
+        print(f"[B 轨] 企业事实 B 库 - 多模态文档解析流水线")
         print(f"{'='*80}")
-        print(f"[+] 正在侧写专家: {EXPERT_NAME} | 客户: {CLIENT_NAME}")
-        distiller = DigitalTwinDistiller()
-        # [核心节点]：将 expert_id 注入到蒸馏过程
-        digital_twin = distiller.distill_digital_twin(final_corpus, current_expert_id)
         
-        # [核心节点]：使用生成的 expert_id（如果 LLM 没有返回）
-        expert_id = digital_twin.expert_id or current_expert_id
-        digital_twin.expert_id = expert_id
-        print(f"[+] 专家唯一标识确认: {expert_id}")
+        if not tenant_id:
+            print(f"[!] B 轨需要 tenant_id 参数，使用默认值 'default'")
+            tenant_id = "default"
         
-        # [核心节点]：为所有知识切片强制赋值 expert_id
-        for chunk in final_corpus:
-            chunk.expert_id = expert_id
+        start_time = time.time()
         
-        # 保存专家画像（兼容旧路径）
-        identity_path = os.path.join(output_dir, "digital_twin_profile.json")
-        with open(identity_path, 'w', encoding='utf-8') as f:
-            json.dump(digital_twin.model_dump(), f, ensure_ascii=False, indent=2)
-        print(f"[+] DigitalTwinProfile 已保存至: {identity_path}")
-        
-        # [核心节点]：使用 ExpertManager 保存专家数据
-        # [核心节点]：使用与全局 enterprise_knowledge_base.json 完全相同的 final_corpus 对象
-        # 严禁中间发生二次处理，确保数量 100% 对齐
-        print(f"\n{'='*80}")
-        print(f"步骤 4.5: 专家数据结构化存储")
+        # 步骤 1: 使用 DoclingMultiModalParser 解析
+        print(f"\n步骤 1: 多模态文档解析 - DoclingMultiModalParser")
         print(f"{'='*80}")
         try:
-            save_success = expert_manager.save_expert(
-                expert_id=expert_id,
-                profile=digital_twin,
-                knowledge_base=final_corpus  # [核心节点]：共享同一对象，零拷贝
-            )
-            if save_success:
-                print(f"[+] 专家 {expert_id} 数据已结构化保存至 data/experts/")
-            else:
-                print(f"[!] 专家 {expert_id} 数据保存失败")
+            docling_parser = DoclingMultiModalParser()
+            parsed_doc = docling_parser.parse(input_file)
+        except ImportError:
+            print(f"[!] Docling 库未安装，跳过 B 轨解析")
+            print(f"[!] 请安装: pip install docling")
+            return None, None
+        except TimeoutError as e:
+            print(f"[!] B 轨解析超时: {e}")
+            return None, None
         except Exception as e:
-            print(f"[!] 专家数据保存异常（非致命）: {type(e).__name__}: {e}")
-            print(f"[!] 全局知识库已保存，隔离知识库写入失败，请手动检查")
-
-    else:
-        print(f"\n[!] 跳过数字孪生侧写步骤")
-        digital_twin = None
-    
-    # [核心节点]：步骤 5 - 自动向量化入库（核心联动）
-    if expert_id and final_corpus:
-        print(f"\n{'='*80}")
-        print(f"步骤 5: 知识向量化入库 - 向量数据库")
+            print(f"[!] B 轨解析失败: {e}")
+            return None, None
+        
+        knowledge_chunks = parsed_doc.chunks
+        print(f"[B 轨] Docling 解析完成，提取 {len(knowledge_chunks)} 个知识切片")
+        
+        if not knowledge_chunks:
+            print("[!] B 轨未提取到任何知识切片，流程终止")
+            return None, None
+        
+        # [跳过对话提纯]：B 库是静态客观知识，不走 Map-Reduce 和画像侧写
+        print(f"\n[B 轨] 跳过对话 Map-Reduce 提纯（静态客观知识无需对话提纯）")
+        print(f"[B 轨] 跳过画像侧写（企业事实文档不包含人设信息）")
+        
+        # 步骤 2: 直接落盘 KnowledgeChunk 列表
+        print(f"\n步骤 2: 知识切片落盘")
+        print(f"{'='*80}")
+        b_kb_path = os.path.join(output_dir, "experts", tenant_id, "tenant_knowledge_base.json")
+        os.makedirs(os.path.dirname(b_kb_path), exist_ok=True)
+        
+        # 序列化 KnowledgeChunk 列表
+        chunk_dicts = []
+        for chunk in knowledge_chunks:
+            chunk_dict = chunk.model_dump()
+            chunk_dict['expert_id'] = tenant_id  # 使用 tenant_id 作为 expert_id
+            chunk_dicts.append(chunk_dict)
+        
+        with open(b_kb_path, 'w', encoding='utf-8') as f:
+            json.dump(chunk_dicts, f, ensure_ascii=False, indent=2)
+        print(f"[B 轨] 知识切片已落盘至: {b_kb_path}")
+        print(f"[B 轨] 共保存 {len(chunk_dicts)} 条知识切片")
+        
+        # 步骤 3: 向量化入库至 tenant_{tenant_id}_kb 集合
+        print(f"\n步骤 3: 知识向量化入库 - tenant_{tenant_id}_kb")
         print(f"{'='*80}")
         try:
             vector_engine = HybridSearchEngine()
+            # 使用 tenant_id 作为 expert_id 入库（HybridSearchEngine 内部使用 expert_id 做集合隔离）
             vector_engine.upsert_full_corpus(
-                expert_id=expert_id,
-                knowledge_base=final_corpus
+                expert_id=tenant_id,
+                knowledge_base=knowledge_chunks
             )
-            print(f"[+] 专家 {expert_id} 知识库已自动向量化入库")
+            print(f"[B 轨] 知识库已自动向量化入库至 tenant_{tenant_id}_kb")
         except Exception as e:
-            print(f"[!] 向量化入库失败: {e}")
-            print(f"[!] 请手动运行向量入库脚本修复")
+            print(f"[!] B 轨向量化入库失败: {e}")
+            print(f"[!] 知识切片已落盘，可稍后手动入库")
+        
+        elapsed_time = time.time() - start_time
+        
+        print(f"\n{'='*80}")
+        print(f"[B 轨] ETL 流程执行完成")
+        print(f"{'='*80}")
+        print(f"摘要:")
+        print(f"  - 解析文件: {input_file}")
+        print(f"  - 提取知识切片: {len(knowledge_chunks)} 条")
+        print(f"  - 落盘路径: {b_kb_path}")
+        print(f"  - 向量集合: tenant_{tenant_id}_kb")
+        print(f"  - 总耗时: {elapsed_time:.2f} 秒")
+        print(f"{'='*80}")
+        
+        return knowledge_chunks, None
     
-    # [物理切除]：步骤 5 的 SillyTavern 兼容格式导出已删除
-    # B 端企业系统不需要酒馆适配器
-    
-    # 打印摘要
-    print(f"\n{'='*80}")
-    print(f"Map-Reduce ETL 流程执行完成")
-    print(f"{'='*80}")
-    print(f"摘要:")
-    print(f"  - 处理 Chunk 数: {len(chunks)}")
-    print(f"  - Map 阶段提取: {len(all_chunks)} 条企业级知识")
-    print(f"  - Reduce 阶段精选: {len(final_corpus)} 条高纯度知识")
-    if digital_twin:
-        print(f"  - 提取专家画像: {digital_twin.expert_name} ({expert_id})")
-        print(f"  - 专家数据目录: data/experts/{expert_id}/")
-        print(f"  - 向量入库状态: {'完成' if expert_id else '跳过'}")
     else:
-        print(f"  - 数字孪生侧写: 已跳过")
-    print(f"  - 总耗时: {elapsed_time:.2f} 秒")
-    print(f"{'='*80}")
-    
-    # [核心节点]：返回最终语料库和专家画像供调用者使用
-    return final_corpus, digital_twin
+        print(f"[!] 不支持的文件格式: {file_ext}")
+        print(f"[!] 支持的格式: .csv, .jsonl (A 轨), .pdf, .docx, .xlsx, .pptx (B 轨)")
+        return None, None
+
 
 
 if __name__ == "__main__":

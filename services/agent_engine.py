@@ -10,10 +10,14 @@ import os
 import sys
 import time
 import json
+import pickle
+import re
 from pathlib import Path
 from typing import List, Optional, Dict
 import openai
 from dotenv import load_dotenv
+import jieba
+
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
@@ -21,9 +25,9 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 # [核心节点]：对接企业级数据契约
 from domain.models import DigitalTwinProfile, KnowledgeChunk, ProbeState
 from services.state_tracker import BusinessIntentProbe
-from services.memory_manager import AdvancedRetriever
 from services.vector_db_service import HybridSearchEngine
 from services.expert_manager import ExpertManager, get_expert_manager
+
 
 
 class ExpertDigitalTwinAgent:
@@ -84,10 +88,9 @@ class ExpertDigitalTwinAgent:
             print("[+] 混合检索引擎初始化完成 (Dense + Sparse + Reranking)")
         except Exception as e:
             print(f"[!] 混合检索引擎初始化失败: {e}")
-            print("[!] 将降级使用传统检索器")
+            print("[!] 降级模式：跳过向量检索，仅使用知识库切片")
             self.vector_db = None
-            self.retriever = AdvancedRetriever()
-            print("[+] 高级检索器初始化完成（降级模式）")
+
         
         # 初始化 OpenAI 客户端（从环境变量读取配置）
         api_key = api_key or os.getenv("SILICONFLOW_API_KEY")
@@ -153,7 +156,114 @@ class ExpertDigitalTwinAgent:
             data = json.load(f)
             return [KnowledgeChunk(**item) for item in data]
     
+    def _local_bm25_fallback(self, query: str, top_k: int = 3) -> List[str]:
+        """
+        [高可用降级防线]：本地 BM25 内存索引检索 + jieba 模糊匹配三级降级
+        
+        输入：
+            - query: 用户查询文本
+            - top_k: 返回数量
+        输出：格式化后的知识切片文本列表
+        副作用：无
+        
+        降级链路：
+            第一级：尝试加载本地 BM25 索引文件 (bm25_index.pkl) 进行关键词检索
+            第二级：BM25 索引不存在或损坏时，使用 jieba 分词在 knowledge_base 中做轻量级模糊匹配
+            第三级：全部失败时返回空列表，绝不抛出异常
+        """
+        print(f"[高可用降级] 启动本地 BM25 降级检索，查询: \"{query}\"")
+        
+        # 第一级：尝试本地 BM25 索引检索
+        try:
+            bm25_index_path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                "data", "experts", self.expert_id, "bm25_index.pkl"
+            )
+            if os.path.exists(bm25_index_path):
+                print(f"[高可用降级] 发现 BM25 索引文件，加载中...")
+                with open(bm25_index_path, 'rb') as f:
+                    bm25_data = pickle.load(f)
+                
+                bm25 = bm25_data["bm25"]
+                corpus = bm25_data["corpus"]
+                metadata_list = bm25_data["metadata"]
+                
+                # jieba 分词查询
+                query_tokens = jieba.lcut(query)
+                bm25_scores = bm25.get_scores(query_tokens)
+                top_indices = sorted(
+                    range(len(bm25_scores)), 
+                    key=lambda i: bm25_scores[i], 
+                    reverse=True
+                )[:top_k]
+                
+                rag_memories = []
+                for idx in top_indices:
+                    if bm25_scores[idx] > 0:  # 只返回有分数的结果
+                        source = metadata_list[idx].get('citation_source', '本地BM25降级')
+                        chunk_type = metadata_list[idx].get('chunk_type', '未知类型')
+                        rag_memories.append(
+                            f"知识切片: {corpus[idx]}\n类型: {chunk_type}\n来源: {source}"
+                        )
+                
+                if rag_memories:
+                    print(f"[高可用降级] BM25 本地检索成功，召回 {len(rag_memories)} 条")
+                    return rag_memories
+                else:
+                    print(f"[高可用降级] BM25 检索完成但无匹配结果，降级到 jieba 模糊匹配")
+            else:
+                print(f"[高可用降级] BM25 索引文件不存在，降级到 jieba 模糊匹配")
+        except Exception as e:
+            print(f"[高可用降级] BM25 索引加载/检索失败: {e}")
+            print(f"[高可用降级] 降级到 jieba 模糊匹配")
+        
+        # 第二级：jieba 分词在 knowledge_base 中做轻量级模糊匹配
+        try:
+            if not self.knowledge_base:
+                print(f"[高可用降级] knowledge_base 为空，无法进行模糊匹配")
+                return []
+            
+            query_tokens = set(jieba.lcut(query))
+            scored_chunks = []
+            
+            for chunk in self.knowledge_base:
+                content = chunk.content
+                chunk_tokens = set(jieba.lcut(content))
+                # 计算 Jaccard 相似度
+                if query_tokens and chunk_tokens:
+                    intersection = query_tokens & chunk_tokens
+                    union = query_tokens | chunk_tokens
+                    score = len(intersection) / len(union) if union else 0
+                else:
+                    score = 0
+                scored_chunks.append((score, chunk))
+            
+            # 按相似度降序排列，取 Top-K
+            scored_chunks.sort(key=lambda x: x[0], reverse=True)
+            top_chunks = scored_chunks[:top_k]
+            
+            rag_memories = []
+            for score, chunk in top_chunks:
+                if score > 0:  # 只返回有匹配的结果
+                    rag_memories.append(
+                        f"知识切片: {chunk.content}\n类型: {chunk.chunk_type}\n来源: {chunk.citation_source}"
+                    )
+                    print(f"    [jieba模糊匹配] 相似度: {score:.3f} | 来源: {chunk.citation_source}")
+            
+            if rag_memories:
+                print(f"[高可用降级] jieba 模糊匹配成功，召回 {len(rag_memories)} 条")
+                return rag_memories
+            else:
+                print(f"[高可用降级] jieba 模糊匹配无结果，返回空列表")
+                return []
+                
+        except Exception as e:
+            print(f"[高可用降级] jieba 模糊匹配也失败: {e}")
+            print(f"[高可用降级] 所有降级方案均失败，返回空列表")
+            return []
+    
     def generate_reply(self, user_input: str, session_history: List[dict] = None, temperature: float = 0.7, frequency_penalty: float = 0.2, presence_penalty: float = 0.2, max_tokens: int = 500, stop_sequences: List[str] = None) -> Dict[str, any]:
+
         """
         [核心节点]：企业级专家回复生成链路
         
@@ -243,14 +353,16 @@ class ExpertDigitalTwinAgent:
                     print(f"    [{i}] 重排得分: {score:.3f} | 来源: {source} | 内容节选: {memory[:50]}...")
             except Exception as e:
                 print(f"❌ [RAG 异常] {e}")
-                print(f"[!] 降级使用传统检索器")
-                rag_memories = []
+                print(f"[!] HybridSearchEngine 运行时异常，启动本地 BM25 降级检索...")
+                # [高可用降级防线]：尝试本地 BM25 内存索引检索
+                rag_memories = self._local_bm25_fallback(user_input)
         else:
-            print(f"[!] 向量数据库未初始化，使用传统检索器")
-            # [核心节点]：降级使用企业知识切片
-            few_shots = self.retriever.get_contextual_knowledge(probe_state, self.knowledge_base, top_k=3)
-            rag_memories = [f"知识切片: {chunk.content}\n类型: {chunk.chunk_type}\n来源: {chunk.citation_source}" for chunk in few_shots]
-            print(f"[+] 传统检索召回知识切片数：{len(rag_memories)}")
+            print(f"[!] 向量数据库未初始化，跳过向量检索")
+            print(f"[!] 降级模式：启动本地 BM25 降级检索...")
+            # [高可用降级防线]：HybridSearchEngine 未初始化，尝试本地 BM25 内存索引检索
+            rag_memories = self._local_bm25_fallback(user_input)
+
+
         
         # [核心节点]：第三步：企业级 Prompt 组装
         print(f"\n[步骤 3] 企业级 Prompt 组装")

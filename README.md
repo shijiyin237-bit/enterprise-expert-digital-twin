@@ -116,11 +116,34 @@ LLM 极度容易在 JSON 外面包裹 ````json` 和解释性废话。本系统�
 
 ## 🗺️ Roadmap | 降维演进路线图
 
-我们深知 V1.0 的极限，更清楚未来的航向。
+```
+V1.0 (已完成) ──────────────────────────────────────────────────────────────
+  ✅ 专家灵魂克隆 (双轨制 ETL)
+  ✅ 混合检索引擎 (Dense + Sparse + Reranking)
+  ✅ 多租户物理隔离 (ChromaDB 集合级)
+  ✅ 业务意图路由 + 算力风控
+  ✅ 神经缝合 Prompt (金牌话术 + CoT + 反机器味)
 
-- **Phase 1 (Current):** 专家灵魂克隆、混合检索引擎、多租户物理隔离。
-- **Phase 2 (Next):** 接入 Docling / Unstructured.io 视觉版面分析引擎，废除脆弱的文本提取，实现 PDF/Word 到 Markdown AST 的物理级降维切片。
-- **Phase 3 (Future):** MCP (Model Context Protocol) 协议挂载。让专家 Agent 告别纯静态的向量知识，动态对接企业 ERP、MySQL 与实时 API。
+V2.0 (当前版本) ────────────────────────────────────────────────────────────
+  ✅ Ingest Hub 2.0 Docling AST (Parser Registry + A/B 双轨分发)
+  ✅ AsyncAgentPool 异步无状态池 (双重检查锁 + asyncio.to_thread)
+  ✅ BM25 内存常驻缓存 (HybridSearchEngine 内部自动降级)
+  ✅ 契约 ACL 闭环 (ChatRequest expert_id 选参 + 100% 向下兼容)
+  ✅ CTO 遥测完全体 (富文本 retrieved_memories + 推理耗时监控)
+
+V3.0 (进行中) ────────────────────────────────────────────────────────────
+  🔲 MCP 多租户文档解析网关 (MCP 客户端管理器 + 双轨混合推理)
+  🔲 专家即标准 Skill 导出 (profile.json MCP 路由配置)
+  🔲 SQL 会话存储 (PostgreSQL/Redis)
+  🔲 自适应缝合 (ToneCalibrationMatrix 动态语气校准)
+
+V4.0 (远期规划) ──────────────────────────────────────────────────────────
+  🔲 MCP 动态 ERP API 挂载 (实时数据查询)
+  🔲 Orchestrator 编排网关 (多 Agent 协作)
+  🔲 生产级监控告警体系 (Grafana/Prometheus)
+  🔲 A/B 测试框架 (Prompt 效果对比)
+```
+
 
 ---
 

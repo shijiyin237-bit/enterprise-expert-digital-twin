@@ -26,6 +26,11 @@ __pycache__/
 *.pyo
 *.pyd
 
-# 5. IDE 配置
+# 5. 快照生成脚本 (物理旁路)
+generate_snapshot.py
+project_snapshot.md
+
+# 6. IDE 配置
 .vscode/
 .idea/
+

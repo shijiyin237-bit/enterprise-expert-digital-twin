@@ -3,9 +3,10 @@ FastAPI 统一网关 - Project 6.0 Persona Engine
 对外提供 RESTful API 接口，内部调用 PersonaAgent 生成回复
 """
 
+import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict
 import uvicorn
 import os
 import sys
@@ -16,6 +17,7 @@ import openai
 
 from services.agent_engine import ExpertDigitalTwinAgent
 import glob
+
 
 # [核心节点]：动态加载默认专家ID（多租户架构）
 def get_default_expert_id() -> str:
@@ -79,11 +81,17 @@ def write_system_trace(user_input: str, business_intent: str, urgency_level: str
 # Pydantic 契约定义
 class ChatRequest(BaseModel):
     """企业级对话请求契约"""
+    expert_id: Optional[str] = Field(
+        default=None,
+        description="目标专家的唯一标识符。若不传，系统会自动降级采用当前的默认专家，保障 100% 向下兼容",
+        examples=["expert_20260509_170336"]
+    )
     user_query: str = Field(
         ...,
         description="企业客户的业务咨询或技术报障，将经过业务意图探针分析后路由至对应专家生成回复",
         examples=["服务器一直报 502 错误怎么排查？", "请问企业版 API 额度如何计费？", "你好，我想咨询一下产品功能"]
     )
+
     session_history: List[dict] = Field(
         default_factory=list,
         description="当前会话的短期上下文历史，格式为 [{'role': 'user/assistant', 'content': '...'}]",
@@ -199,6 +207,39 @@ class TitleResponse(BaseModel):
     )
 
 
+class AsyncAgentPool:
+    """
+    企业级无状态异步 Agent 缓存池 (Thread-safe & Async non-blocking)
+    以 expert_id 为 Key，缓存已初始化的 ExpertDigitalTwinAgent 实例。
+    利用 asyncio.to_thread 将重度磁盘 I/O 剥离出主事件循环，实现真正的多租户高并发。
+    """
+    def __init__(self):
+        self._pool: Dict[str, ExpertDigitalTwinAgent] = {}
+        self._lock = asyncio.Lock()
+        self.default_expert_id: Optional[str] = None
+    
+    async def get_agent(self, expert_id: str) -> ExpertDigitalTwinAgent:
+        """线程安全、非阻塞的 Agent 获取与冷启动创建"""
+        if expert_id not in self._pool:
+            async with self._lock:
+                # 双重检查锁，防并发冷启动穿透
+                if expert_id not in self._pool:
+                    print(f"[AgentPool] 正在异步冷启动加载专家实例: {expert_id}...")
+                    # [核心节点]：使用 asyncio.to_thread 剥离同步重度 I/O，保障 Uvicorn 零阻塞
+                    new_agent = await asyncio.to_thread(ExpertDigitalTwinAgent, expert_id=expert_id)
+                    self._pool[expert_id] = new_agent
+                    print(f"[AgentPool] 专家 [{new_agent.expert_profile.expert_name}] 加载完成，并入缓存池。")
+        return self._pool[expert_id]
+    
+    async def reload_agent(self, expert_id: str) -> ExpertDigitalTwinAgent:
+        """强制重载缓存池中的特定专家实例（热更新/重炼）"""
+        async with self._lock:
+            print(f"[AgentPool] 正在强制重载专家缓存: {expert_id}...")
+            new_agent = await asyncio.to_thread(ExpertDigitalTwinAgent, expert_id=expert_id)
+            self._pool[expert_id] = new_agent
+            return new_agent
+
+
 # [核心节点]：初始化 FastAPI 企业级网关
 app = FastAPI(
     title="企业级专家数字孪生系统网关",
@@ -206,22 +247,26 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# [核心节点]：初始化全局 ExpertDigitalTwinAgent 实例（多租户架构）
-print("[系统点火] 正在探测已炼丹的专家数据...")
-default_expert_id = get_default_expert_id()
+# [核心节点]：声明全局无状态 Agent 缓存池（替代旧的全局 agent 变量）
+agent_pool = AsyncAgentPool()
 
-if not default_expert_id:
-    print("[错误] 未找到任何已炼丹的专家数据，请先运行 etl_pipeline.py")
-    print("[提示] 运行命令: python services/etl_pipeline.py")
-    sys.exit(1)
 
-print(f"[系统点火] 正在加载默认专家: {default_expert_id}")
-try:
-    agent = ExpertDigitalTwinAgent(expert_id=default_expert_id)
-    print(f"[系统点火] 专家 [{agent.expert_profile.expert_name}] 加载完成，系统准备就绪\n")
-except Exception as e:
-    print(f"[致命错误] 专家加载失败: {e}")
-    sys.exit(1)
+# [核心节点]：系统异步点火与默认专家常驻内存预热
+@app.on_event("startup")
+async def startup_event():
+    """系统异步点火与默认专家常驻内存预热"""
+    print("[系统点火] 正在探测已炼丹的专家数据...")
+    default_id = get_default_expert_id()
+    if not default_id:
+        print("[错误] 未找到任何已炼丹的专家数据，请先运行 etl_pipeline.py")
+        sys.exit(1)
+    
+    agent_pool.default_expert_id = default_id
+    print(f"[系统点火] 正在异步预载默认专家: {default_id} (Pre-warming)...")
+    # 预热默认专家，确保首个请求 0ms 延迟
+    await agent_pool.get_agent(default_id)
+    print("[系统点火] 默认专家已载入内存，网关正式上线！\n")
+
 
 # [物理切除]：SillyTavern 适配器已物理删除
 # B 端企业系统不需要酒馆角色卡导出功能
@@ -249,12 +294,14 @@ async def root():
     tags=["系统状态接口"]
 )
 async def health_check():
-    """健康检查接口"""
+    """健康检查接口 - 从 agent_pool 动态读取默认专家完成自检"""
+    default_agent = await agent_pool.get_agent(agent_pool.default_expert_id)
     return {
         "status": "healthy",
-        "expert_name": agent.expert_profile.expert_name,
-        "knowledge_base_size": len(agent.knowledge_base)
+        "expert_name": default_agent.expert_profile.expert_name,
+        "knowledge_base_size": len(default_agent.knowledge_base)
     }
+
 
 
 @app.post(
@@ -266,10 +313,13 @@ async def health_check():
 )
 async def chat(request: ChatRequest):
     """
-    聊天接口 - 接收用户输入，生成企业级专家回复
+    聊天接口 - 纯无状态多租户分流模式
+    
+    动态解析目标 expert_id，从 AsyncAgentPool 缓存池中异步获取 Agent 实例，
+    将重度推理与重排 offload 到后台线程池，主事件循环高并发零假死。
     
     Args:
-        request: 包含 user_query 的请求体
+        request: 包含 user_query 和可选 expert_id 的请求体
         
     Returns:
         ChatResponse: 包含回复、业务意图和紧急程度的响应
@@ -277,8 +327,16 @@ async def chat(request: ChatRequest):
     try:
         print(f"\n[API] 收到聊天请求: \"{request.user_query}\"")
         
-        # [核心节点]：调用企业级专家数字孪生引擎生成回复
-        result = agent.generate_reply(
+        # [核心节点]：动态解析目标 expert_id（多租户分流）
+        target_expert_id = request.expert_id or agent_pool.default_expert_id
+        print(f"    - 目标专家: {target_expert_id}")
+        
+        # [核心节点]：从 AsyncAgentPool 缓存池中异步获取 Agent 实例
+        agent = await agent_pool.get_agent(target_expert_id)
+        
+        # [核心节点]：重度推理与重排 offload 到后台线程池，主事件循环高并发零假死
+        result = await asyncio.to_thread(
+            agent.generate_reply,
             request.user_query,
             request.session_history,
             request.temperature,
@@ -319,11 +377,12 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
 
 
+
 @app.post(
     "/api/v1/switch_expert",
     response_model=SwitchExpertResponse,
     summary="切换专家",
-    description="动态切换当前激活的专家，无需重启服务。接收 expert_id 参数，重新初始化 ExpertDigitalTwinAgent。",
+    description="动态切换当前激活的专家，无需重启服务。接收 expert_id 参数，通过 AsyncAgentPool 刷新缓存池。",
     tags=["多租户专家管理"]
 )
 async def switch_expert(request: SwitchExpertRequest):
@@ -331,7 +390,7 @@ async def switch_expert(request: SwitchExpertRequest):
     切换专家接口 - 多租户架构核心功能
     
     允许指挥官在运行时切换不同专家（如从儿科切换到法律），无需重启服务。
-    全局变量 agent 被重新赋值为新的 ExpertDigitalTwinAgent 实例。
+    通过 agent_pool.reload_agent() 刷新缓存池，彻底去除危险的 global agent 全局变量修改。
     
     Args:
         request: 包含目标 expert_id 的请求体
@@ -339,8 +398,6 @@ async def switch_expert(request: SwitchExpertRequest):
     Returns:
         SwitchExpertResponse: 切换结果，包含成功状态和当前专家名称
     """
-    global agent
-    
     try:
         print(f"\n[多租户切换] 收到专家切换请求: {request.expert_id}")
         
@@ -350,36 +407,41 @@ async def switch_expert(request: SwitchExpertRequest):
         
         if not os.path.exists(target_expert_path) or not os.listdir(target_expert_path):
             print(f"[多租户切换] 专家不存在或目录为空: {request.expert_id}")
+            # 从缓存池获取当前默认专家名称用于响应
+            current_agent = await agent_pool.get_agent(agent_pool.default_expert_id)
             return SwitchExpertResponse(
                 success=False,
                 message=f"专家 '{request.expert_id}' 不存在或未完成炼丹，请检查 expert_id",
-                expert_name=agent.expert_profile.expert_name if agent else ""
+                expert_name=current_agent.expert_profile.expert_name
             )
         
-        # [核心节点]：重新初始化全局 agent 实例
-        print(f"[多租户切换] 正在加载新专家: {request.expert_id}")
-        new_agent = ExpertDigitalTwinAgent(expert_id=request.expert_id)
+        # [核心节点]：通过 agent_pool.reload_agent() 刷新缓存池，彻底去除危险的 global agent
+        print(f"[多租户切换] 正在通过 AsyncAgentPool 重载专家: {request.expert_id}")
+        new_agent = await agent_pool.reload_agent(request.expert_id)
         
-        # 切换成功后才赋值给全局变量
-        agent = new_agent
+        # [核心节点]：同步更新默认 expert_id，使后续无 expert_id 的请求自动路由到新专家
+        agent_pool.default_expert_id = request.expert_id
         
-        print(f"[多租户切换] 专家切换成功！当前专家: [{agent.expert_profile.expert_name}]")
+        print(f"[多租户切换] 专家切换成功！当前专家: [{new_agent.expert_profile.expert_name}]")
         
         return SwitchExpertResponse(
             success=True,
-            message=f"专家切换成功，当前以【{agent.expert_profile.expert_name}】身份应答",
-            expert_name=agent.expert_profile.expert_name
+            message=f"专家切换成功，当前以【{new_agent.expert_profile.expert_name}】身份应答",
+            expert_name=new_agent.expert_profile.expert_name
         )
         
     except Exception as e:
         error_traceback = traceback.format_exc()
         print(f"[多租户切换] 切换失败:")
         print(error_traceback)
+        # 从缓存池获取当前默认专家名称用于响应
+        current_agent = await agent_pool.get_agent(agent_pool.default_expert_id)
         return SwitchExpertResponse(
             success=False,
             message=f"专家切换失败: {str(e)}",
-            expert_name=agent.expert_profile.expert_name if agent else ""
+            expert_name=current_agent.expert_profile.expert_name
         )
+
 
 
 @app.post("/api/v1/generate_title", response_model=TitleResponse)
